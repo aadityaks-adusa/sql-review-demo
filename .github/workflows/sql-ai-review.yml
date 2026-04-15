@@ -1,0 +1,54 @@
+name: SQL AI Review — Copilot-Powered
+
+on:
+  pull_request:
+    paths: ["**/*.sql"]
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+# Permissions required for posting reviews, labels, and GitHub Models API
+permissions:
+  contents: read
+  pull-requests: write    # post PR reviews (REQUEST_CHANGES / APPROVE)
+  issues: write           # add labels
+  models: read            # GitHub Models API via GITHUB_TOKEN — no extra secrets needed
+
+jobs:
+  sql-ai-review:
+    name: sql-ai-review
+    runs-on: ubuntu-latest
+
+    steps:
+      # Full history required so git diff can see the base commit
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # STEP 1 — AI Review
+      # GitHub Models (GPT-4o) reads the full diff and applies the SQL rules
+      # from .github/scripts/sql_review_prompt.md (same rules as copilot-instructions.md)
+      # Output: /tmp/review.json
+      # -----------------------------------------------------------------------
+      - name: "Step 1 — AI SQL Review (GitHub Models · GPT-4o)"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SQL_REVIEW_OUTPUT: /tmp/review.json
+        run: python3 .github/scripts/ai_sql_reviewer.py
+
+      # -----------------------------------------------------------------------
+      # STEP 2 — Enforce
+      # Reads review.json → posts PR review → adds label → exits 1 on HARD_BLOCK
+      # Runs even if Step 1 fails (safety block)
+      # -----------------------------------------------------------------------
+      - name: "Step 2 — Enforce (post review · label · gate)"
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SQL_SCAN_REVIEW_FILE: /tmp/review.json
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: python3 .github/scripts/enforce.py

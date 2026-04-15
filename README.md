@@ -1,639 +1,472 @@
-# 🛡️ SQL PR Review Gate — Detect · Reason · Enforce
+# 🤖 SQL AI Review Gate — Copilot-Powered · No Hardcoded Rules
 
-> **Live demo repo for the Coreservices Database Deployments SQL review automation.**
-> Every `.sql` file change in a pull request flows through three automated layers before a single line reaches production.
+> **Live demo of an AI-first SQL PR review pipeline for PostgreSQL + Flyway.**
+> Rules live in plain English inside `.github/copilot-instructions.md`.
+> GitHub Models (GPT-4o) does all SQL analysis — no regex, no hardcoded patterns.
+
+**Repo:** https://github.com/aadityaks-adusa/sql-review-demo
 
 ---
 
 ## Table of Contents
 
-1. [What Problem Does This Solve?](#1-what-problem-does-this-solve)
-2. [Architecture Overview](#2-architecture-overview)
-3. [How CI/CD Triggers](#3-how-cicd-triggers)
-4. [Layer 1 — Detect (`sql_pr_scan.py`)](#4-layer-1--detect-sql_pr_scanpy)
-5. [Layer 2 — Reason (`llm_reason.py`)](#5-layer-2--reason-llm_reasonpy)
-6. [Layer 3 — Enforce (`enforce.py`)](#6-layer-3--enforce-enforcepy)
+1. [Why AI-Only?](#1-why-ai-only--analysis)
+2. [Architecture](#2-architecture)
+3. [How GitHub Copilot Review Fits In](#3-how-github-copilot-review-fits-in)
+4. [Pipeline: Step-by-Step](#4-pipeline-step-by-step)
+5. [The Rules — copilot-instructions.md](#5-the-rules--copilot-instructionsmd)
+6. [Evaluation Framework](#6-evaluation-framework)
 7. [Live Demo PRs](#7-live-demo-prs)
-8. [Risk Tier Reference](#8-risk-tier-reference)
-9. [Setup Guide](#9-setup-guide)
-10. [File Reference](#10-file-reference)
+8. [Setup Guide](#8-setup-guide)
+9. [File Reference](#9-file-reference)
 
 ---
 
-## 1. What Problem Does This Solve?
+## 1. Why AI-Only? — Analysis
 
-**Real incident — OCDOMAIN-15294 (PR #573)**
+The original pipeline used 25 hardcoded Python regex rules (`sql_pr_scan.py`).
+After stakeholder feedback, the system was redesigned to use **AI as the primary reviewer**
+with rules expressed in plain English.
 
-```sql
--- What was merged ❌
-ALTER TABLE cart.cpt_cart ADD COLUMN discount_ref_cd VARCHAR(20);
+### Comparison: Hardcoded Rules vs Pure AI
 
--- Flyway retried on rollback → CRASH:
--- ERROR: column "discount_ref_cd" of relation "cpt_cart" already exists
-```
+| Dimension | Hardcoded Rules (`sql_pr_scan.py`) | AI-Only (GitHub Models GPT-4o) |
+|---|---|---|
+| **Determinism** | 100% — same input, same output always | Near-deterministic at temp=0.1; ~95%+ consistent |
+| **Speed** | ~1-2 seconds | ~15-30 seconds |
+| **Cost** | Free (no API calls) | Free with GitHub Copilot (`GITHUB_TOKEN` + `models: read`) |
+| **False positives** | Known, documented false positive rate | Can hallucinate but rare at low temperature |
+| **False negatives** | Only catches explicitly coded patterns | Can reason about novel, uncoded patterns |
+| **Novel patterns** | Misses anything not in the regex list | Can reason about new antipatterns from context |
+| **Multi-line awareness** | Partial (manual multi-line extraction) | Full semantic understanding across the whole diff |
+| **Context understanding** | None — regex on isolated lines | Understands intent, comments, surrounding code |
+| **Business context** | None | Understands Flyway retry model, locking semantics |
+| **Rule maintenance** | 25 regex patterns in Python — requires Python skills | Plain English in `copilot-instructions.md` — editable by DBAs |
+| **Audit trail** | Exact rule name that fired | LLM reasoning (softer but more explainable) |
+| **Rate limits** | None | GitHub Models rate limits (generous free tier) |
+| **Failure mode** | Scanner always runs; blocks on findings | If API fails → safety block the PR |
+| **Dollar-quote context** | Manual parser required to detect function bodies | Understands `$$...$$` semantically |
 
-A missing `IF NOT EXISTS` guard caused a production Flyway failure.
+### Recommendation
 
-**This system catches it automatically** — before the PR can be merged, before it reaches any environment.
+**Use AI-primary with a safe fallback.** The redesigned pipeline:
 
-### What it replaces / augments
+- ✅ Delegates ALL SQL analysis to the AI (no regex rules in Python)
+- ✅ Python handles only path-based file type detection (not SQL parsing)
+- ✅ Rules live in `copilot-instructions.md` — editable by DBAs without Python knowledge
+- ✅ Same rules power both the workflow enforcement AND Copilot code review
+- ✅ If AI is unavailable → PR is blocked rather than silently approved
+- ✅ Evaluation suite (`evals/`) validates AI correctness for known patterns
 
-| Without this system | With this system |
-|---|---|
-| Manual DBA review of every SQL PR | Automated triage → DBA only sees what needs human judgment |
-| "Looks fine to me" from a developer | LLM-generated plain-English risk explanation + corrected SQL |
-| PR merges with a bad pattern | PR is blocked at the CI gate until the pattern is fixed |
-| Inconsistent review quality | 25 rules applied identically to every PR, every time |
+### What the AI adds beyond regex
+
+1. **Multi-line statement awareness** — understands that a `WHERE` on line 8 satisfies a `DELETE FROM` on line 6
+2. **Dollar-quote context** — knows `TRUNCATE` inside `$function$...$function$` is legitimate ETL
+3. **Semantic understanding** — can flag `ALTER TABLE orders.cpt_cart SET STATISTICS 1000` (unusual, worth DBA review) even though it's not in any regex list
+4. **Corrected SQL** — generates the exact fix, not just a description
+5. **Plain-English risk** — explains the real business consequence (locking, revert risk, specific incident numbers)
 
 ---
 
-## 2. Architecture Overview
+## 2. Architecture
 
 ```mermaid
 flowchart TD
-    PR["🔀 Developer opens Pull Request\n(touches *.sql file)"]
-    WF["GitHub Actions Workflow\nsql-pr-scan.yml"]
-
-    PR --> WF
-
-    subgraph pipeline ["Three-Step Pipeline"]
-        direction TB
-
-        S1["Step 1 · Detect\nsql_pr_scan.py\n─────────────────\n25 regex rules\ngit diff analysis\ncontext-aware scanner"]
-        F1[/"📄 findings.json\nArray of violations\nwith tier + line + snippet"/]
-
-        S2["Step 2 · Reason\nllm_reason.py\n─────────────────\nGitHub Models API\nGPT-4o-mini\nNo extra secrets needed"]
-        F2[/"📄 review.json\nOverall tier\nPlain-English risk\nCorrected SQL per finding"/]
-
-        S3["Step 3 · Enforce\nenforce.py\n─────────────────\nGitHub REST API\nPost PR review\nAdd label\nExit 1 if HARD_BLOCK"]
-
-        S1 --> F1 --> S2 --> F2 --> S3
-    end
-
-    WF --> pipeline
-
-    S3 --> HB["🚫 HARD_BLOCK\nREQUEST_CHANGES\nlabel: sql-hard-block\ncheck: ❌ FAILS\nPR cannot merge"]
-    S3 --> DB["⚠️ DBA_REVIEW\nREQUEST_CHANGES\nlabel: dba-review-required\ncheck: ✅ passes\nDBA must approve"]
-    S3 --> CL["✅ CLEAN\nAPPROVE\nlabel: sql-scan-clean\ncheck: ✅ passes\nReady to merge"]
+    DEV["👨‍💻 Developer opens PR\n(touches *.sql file)"]
+    
+    DEV --> WF["GitHub Actions\nsql-ai-review.yml"]
+    DEV --> CR["GitHub Copilot\nCode Review\n(optional — request @github-copilot as reviewer)"]
+    
+    CR --> INST[".github/copilot-instructions.md\n.github/instructions/sql.instructions.md\n─────────────────\nSQL rules in plain English\n≤4000 chars for Copilot\nSame rules as system prompt"]
+    INST --> INLINE["Inline PR comments\nLine-level suggestions\nApply-with-one-click fixes\n(COMMENT only — cannot block)"]
+    
+    WF --> S1["Step 1 — AI Review\nai_sql_reviewer.py\n─────────────────\nGitHub Models GPT-4o\nReads sql_review_prompt.md\nAll SQL rules as system prompt\nNo hardcoded regex"]
+    
+    S1 --> RJ[/"📄 /tmp/review.json\n{overall_tier, summary,\nfindings [{file, line, pattern,\ntier, risk, fix}]}"/]
+    
+    RJ --> S2["Step 2 — Enforce\nenforce.py\n─────────────────\nGitHub REST API\nPost PR review\nAdd label\nExit 1 if HARD_BLOCK"]
+    
+    S2 --> HB["🚫 HARD_BLOCK\nREQUEST_CHANGES\nsql-hard-block label\nCheck: ❌ FAILS\nMerge blocked"]
+    S2 --> DB["⚠️ DBA_REVIEW\nREQUEST_CHANGES\ndba-review-required label\nCheck: ✅ passes\nDBA must approve"]
+    S2 --> CL["✅ CLEAN\nAPPROVE\nsql-scan-clean label\nCheck: ✅ passes\nReady to merge"]
 ```
 
 ### Key design decisions
 
 | Decision | Rationale |
 |---|---|
-| **Static scanner runs first, LLM runs second** | Deterministic rules never hallucinate. The LLM only adds context and corrected SQL on top of already-confirmed findings. |
-| **GitHub Models API (GPT-4o-mini)** | Uses the workflow's built-in `GITHUB_TOKEN` — zero extra secrets or API keys needed. |
-| **LLM has a fallback** | If the Models API is down, `llm_reason.py` generates structured output from scanner results directly. The pipeline always completes. |
-| **Scanner exits 0 — enforce.py owns exit 1** | The scanner never short-circuits the pipeline. The LLM reasons first; the enforcer decides the final exit code. |
+| **No regex rules in Python** | Rules in `copilot-instructions.md` are editable by DBAs, not just engineers |
+| **Single AI pass** (was 3 steps) | Detect + Reason merged → simpler, faster, fewer failure points |
+| **GPT-4o** (upgraded from gpt-4o-mini) | Better multi-line reasoning and context understanding for SQL |
+| **Safety block on API failure** | Unreviewed SQL should not merge — fail closed, not open |
+| **Same rules file for both Copilot and workflow** | Single source of truth; DBA edits `copilot-instructions.md` and both channels update |
 
 ---
 
-## 3. How CI/CD Triggers
+## 3. How GitHub Copilot Review Fits In
 
-The workflow is defined in `.github/workflows/sql-pr-scan.yml`:
+GitHub Copilot Code Review is the **human-facing** layer. The workflow is the **enforcement** layer.
+
+> **Key constraint** (from GitHub docs): *"Copilot always leaves a 'Comment' review, not an 'Approve' review or a 'Request changes' review. This means that Copilot's reviews **cannot block merging**."*
+
+This means:
+
+| Layer | Mechanism | Can Block PR? | Best For |
+|---|---|---|---|
+| **GitHub Copilot Code Review** | `@github-copilot` reviewer | ❌ No — COMMENT only | Developer feedback, inline suggestions, apply-with-click fixes |
+| **Workflow (GitHub Models)** | GitHub Actions + REST API | ✅ Yes — REQUEST_CHANGES + exit 1 | Enforcement gate, mandatory compliance |
+
+### How to enable Copilot automatic reviews
+
+In the demo repo settings (or enterprise settings):
+1. Go to **Settings → Copilot → Code review**
+2. Enable **"Automatic code review"**
+3. Copilot will read `.github/copilot-instructions.md` automatically on every PR
+
+Or manually: open a PR → **Reviewers → Copilot** → wait ~30 seconds for inline comments.
+
+### The copilot-instructions.md dual role
+
+```
+.github/copilot-instructions.md
+         │
+         ├──► GitHub Copilot Code Review
+         │    Reads file when reviewing PRs
+         │    Posts inline COMMENT-type reviews
+         │    Bound by 4000-char limit
+         │
+         └──► .github/scripts/sql_review_prompt.md
+              Full untruncated version of the same rules
+              Used as system prompt for GitHub Models API
+              Posted as REQUEST_CHANGES by enforce.py
+```
+
+---
+
+## 4. Pipeline: Step-by-Step
+
+### Trigger
 
 ```yaml
 on:
   pull_request:
-    paths: ["**/*.sql"]        # only runs when .sql files are changed
+    paths: ["**/*.sql"]   # only runs when .sql files change
     branches: [main]
     types: [opened, synchronize, reopened]
 
 permissions:
-  contents: read
-  pull-requests: write         # needed to post reviews
-  issues: write                # needed to add labels
-  models: read                 # needed for GitHub Models API (GPT-4o-mini)
+  models: read            # grants GitHub Models API access — no extra secrets needed
 ```
 
-**What triggers a re-run:** Any new commit pushed to the PR branch that includes a `.sql` file change.
+### Step 1 — AI SQL Review (`ai_sql_reviewer.py`)
 
-**Branch protection (recommended):** Set `sql-review / sql-review` as a required status check on `main`. This makes the HARD_BLOCK gate mandatory — the merge button is greyed out until the check passes.
-
-```
-Repository Settings → Branches → Branch protection rules → main
-  ✅ Require status checks to pass before merging
-      Add: "sql-review / sql-review"
-  ✅ Require branches to be up to date before merging
-```
-
----
-
-## 4. Layer 1 — Detect (`sql_pr_scan.py`)
-
-### What it does
-
-Runs 25 deterministic regex rules against the lines added in the PR diff. It is context-aware:
-
-- Checks multi-line statements (e.g. `DELETE FROM` on line 5, `WHERE` on line 6 → not flagged)
-- Detects PL/pgSQL dollar-quote boundaries — does not flag `TRUNCATE` inside a stored procedure
-- Classifies each file as `DDL_versioned`, `DDL_repeatable`, `DML`, or `OTHER`
-- Applies different rule sets per file type (e.g. `ADD COLUMN IF NOT EXISTS` check only on `V*.sql`)
-
-### Input
-
-The git diff between `BASE_SHA` and `HEAD_SHA`, resolved via:
-
-```bash
-git diff --name-only --diff-filter=ACMR $BASE_SHA $HEAD_SHA
-git diff $BASE_SHA $HEAD_SHA --unified=0 -- <file>
-```
-
-Environment variables supplied by the workflow:
-
-```
-BASE_SHA  = github.event.pull_request.base.sha
-HEAD_SHA  = github.event.pull_request.head.sha
-SQL_SCAN_FINDINGS_FILE = /tmp/findings.json
-```
-
-### Output — `findings.json`
-
-```json
-[
-  {
-    "file": "migrations/V1.0.1__add_discount_feature.sql",
-    "file_type": "DDL_versioned",
-    "line_number": 14,
-    "line_content": "ALTER TABLE orders.cpt_order ADD COLUMN discount_pct NUMERIC(5,2);",
-    "pattern": "ADD COLUMN without IF NOT EXISTS",
-    "description": "ADD COLUMN without IF NOT EXISTS — Flyway will fail on retry. Real incident OCDOMAIN-15294 (PR #573) was caused by this. Use: ALTER TABLE IF EXISTS <t> ADD COLUMN IF NOT EXISTS <col> ...",
-    "tier": "HARD_BLOCK"
-  },
-  {
-    "file": "migrations/V1.0.1__add_discount_feature.sql",
-    "file_type": "DDL_versioned",
-    "line_number": 18,
-    "line_content": "CREATE INDEX idx_cpt_order_discount ON orders.cpt_order(discount_pct);",
-    "pattern": "CREATE INDEX without IF NOT EXISTS",
-    "description": "Missing IF NOT EXISTS guard — index creation will fail on retry; add IF NOT EXISTS",
-    "tier": "DBA_REVIEW"
-  }
-]
-```
-
-### GitHub Actions step summary (written to `$GITHUB_STEP_SUMMARY`)
-
-```
-## 🚫 SQL PR Review — BLOCKED
-
-This PR contains SQL patterns that **cannot merge** without senior DBA review and explicit override.
-
----
-
-### Files Reviewed
-
-| File                                          | Type          | Tier       | Findings |
-|-----------------------------------------------|---------------|------------|----------|
-| migrations/V1.0.1__add_discount_feature.sql   | DDL_versioned | 🚫 Blocked | 2        |
-
----
-
-### Findings
-
-| File                                | Line | Pattern                              | Tier          |
-|-------------------------------------|------|--------------------------------------|---------------|
-| V1.0.1__add_discount_feature.sql    | 14   | ADD COLUMN without IF NOT EXISTS     | 🚫 HARD_BLOCK |
-| V1.0.1__add_discount_feature.sql    | 18   | CREATE INDEX without IF NOT EXISTS   | ⚠️ DBA_REVIEW  |
-```
-
----
-
-## 5. Layer 2 — Reason (`llm_reason.py`)
-
-### What it does
-
-Reads `findings.json` and the full git diff, then calls the **GitHub Models API** (`gpt-4o-mini`) with a structured system prompt. The LLM's job is only two things:
-
-1. Explain in 1–2 plain-English sentences **why** each finding is risky
-2. Provide the **exact corrected SQL** as a fenced code block
-
-### Input
-
-```
-findings.json   (from Step 1)
-git diff        (raw diff, capped at 10,000 characters)
-GITHUB_TOKEN    (built-in workflow token — grants GitHub Models access)
-```
-
-### System prompt (sent to GPT-4o-mini)
-
-```
-You are a senior PostgreSQL DBA reviewing Flyway SQL migration files for a large retail enterprise.
-
-Context:
-- Migration engine: Flyway — all SQL runs inside a transaction; retries are possible
-- File types: V*.sql = versioned DDL (runs once), R__*.sql = repeatable DDL, DM*.sql = DML only
-- Environments: nonprd (dev/qa/stage) and prd (production)
-
-An automated scanner has already found specific violations. Your job is ONLY to:
-1. Explain WHY each finding is risky in 1-2 plain-English sentences
-2. Provide the EXACT corrected SQL as a fenced ```sql code block```
-
-Rules:
-- Never suggest CREATE INDEX CONCURRENTLY — Flyway transactions forbid it
-- For ADD COLUMN, always use: ALTER TABLE IF EXISTS <schema>.<table> ADD COLUMN IF NOT EXISTS <col> <type>
-...
-
-Respond with ONLY valid JSON — no markdown fences, no explanation outside the JSON.
-```
-
-### API call (GitHub Models endpoint)
-
+**Python's role (path-based only — no SQL parsing):**
 ```python
-POST https://models.inference.ai.azure.com/chat/completions
-Authorization: Bearer <GITHUB_TOKEN>
-
-{
-  "model": "gpt-4o-mini",
-  "temperature": 0.1,          # near-deterministic for consistency
-  "max_tokens": 2500,
-  "response_format": {"type": "json_object"},
-  "messages": [
-    {"role": "system", "content": "<system prompt above>"},
-    {"role": "user",   "content": "<findings.json + git diff>"}
-  ]
-}
+def classify_file(path: str) -> str:
+    # V*.sql      → DDL_versioned
+    # R__*.sql    → DDL_repeatable
+    # DM*.sql or *_dml/ → DML or DML_production
+    # (that's all Python does — AI does the rest)
 ```
 
-**No additional secrets or API keys are required.** GitHub Models is gated by `permissions: models: read` in the workflow.
+**What is sent to GPT-4o:**
+```
+System: [full contents of sql_review_prompt.md — all rules in plain English]
 
-### Output — `review.json`
+User:
+  Changed SQL files:
+    - migrations/V1.0.1__bad_migration.sql  [type: DDL_versioned]
 
+  Full git diff:
+  ```diff
+  +ALTER TABLE orders.cpt_order ADD COLUMN discount_pct NUMERIC(5,2);
+  ```
+```
+
+**`review.json` output:**
 ```json
 {
   "overall_tier": "HARD_BLOCK",
-  "summary": "This migration has a critical idempotency failure that will crash Flyway on any retry or rollback. The ADD COLUMN statement must include an IF NOT EXISTS guard, as demonstrated by the real production incident OCDOMAIN-15294.",
+  "summary": "This migration will crash on any Flyway retry because ADD COLUMN lacks the IF NOT EXISTS guard — the exact pattern that caused the OCDOMAIN-15294 production outage.",
   "findings": [
     {
-      "file": "migrations/V1.0.1__add_discount_feature.sql",
-      "line": 14,
+      "file": "migrations/V1.0.1__bad_migration.sql",
+      "line": 1,
       "pattern": "ADD COLUMN without IF NOT EXISTS",
-      "risk": "If Flyway retries this migration (e.g. after a partial failure or network blip), it will crash with 'column already exists' — exactly what caused the OCDOMAIN-15294 production outage. This is a hard block because the failure is guaranteed on retry.",
+      "tier": "HARD_BLOCK",
+      "risk": "Flyway retries this entire script if it fails mid-run. The second attempt will crash with 'column already exists' — exactly as documented in incident OCDOMAIN-15294.",
       "fix": "ALTER TABLE IF EXISTS orders.cpt_order ADD COLUMN IF NOT EXISTS discount_pct NUMERIC(5,2);"
-    },
-    {
-      "file": "migrations/V1.0.1__add_discount_feature.sql",
-      "line": 18,
-      "pattern": "CREATE INDEX without IF NOT EXISTS",
-      "risk": "Without the IF NOT EXISTS guard, this index creation will fail on any retry of the migration, leaving the schema in a partially applied state. Note: CONCURRENTLY is not an option inside Flyway transactions.",
-      "fix": "CREATE INDEX IF NOT EXISTS idx_cpt_order_discount ON orders.cpt_order(discount_pct);"
     }
   ]
 }
 ```
 
-### Fallback behavior
+### Step 2 — Enforce (`enforce.py`)
 
-If the GitHub Models API is unavailable (network error, quota, etc.):
-
-```python
-# llm_reason.py automatically falls back to structured scanner output
-def _fallback_review(findings, overall_tier):
-    return {
-        "overall_tier": overall_tier,
-        "summary": f"[LLM unavailable — scanner output] {len(findings)} finding(s) detected.",
-        "findings": [
-            {
-                "file": f["file"],
-                "line": f["line_number"],
-                "pattern": f["pattern"],
-                "risk": f["description"],   # scanner description used directly
-                "fix": "See Confluence DML CICD policy for the correct form."
-            }
-            for f in findings
-        ]
-    }
-```
-
-The pipeline continues and the enforcement step still blocks or approves correctly.
-
----
-
-## 6. Layer 3 — Enforce (`enforce.py`)
-
-### What it does
-
-Reads `review.json` and calls the **GitHub REST API** to:
-
-1. Ensure three labels exist on the repo (`sql-hard-block`, `dba-review-required`, `sql-scan-clean`)
-2. Remove any stale scan label from the PR
-3. Add the appropriate new label
-4. Post a formatted PR review (`REQUEST_CHANGES` or `APPROVE`)
-5. Exit with code `1` if `overall_tier == HARD_BLOCK` → fails the required CI check
-
-### Input
-
-```
-review.json       (from Step 2)
-GITHUB_TOKEN      (built-in — posts reviews as github-actions[bot])
-PR_NUMBER         (from github.event.pull_request.number)
-REPO              (from github.repository, e.g. "aadityaks-adusa/sql-review-demo")
-```
-
-### GitHub API calls made
-
-```
-GET    /repos/{REPO}/labels/{name}                    → check if label exists
-POST   /repos/{REPO}/labels                           → create label if missing
-GET    /repos/{REPO}/issues/{PR}/labels               → get current PR labels
-DELETE /repos/{REPO}/issues/{PR}/labels/{name}        → remove stale scan label
-POST   /repos/{REPO}/issues/{PR}/labels               → add new label
-POST   /repos/{REPO}/pulls/{PR}/reviews               → post the review
-```
-
-### PR review body (what the developer sees in the PR)
-
-**For HARD_BLOCK (PR #1 example):**
-
-```
-## 🚫 SQL Review — HARD BLOCK — must fix before merge
-
-This migration has a critical idempotency failure that will crash Flyway on any
-retry or rollback.
-
-> **How to unblock:** Fix the issue(s) below and push again.
-> The scanner will re-run automatically and approve when clean.
-
----
-
-### Finding 1 of 2 — `ADD COLUMN without IF NOT EXISTS` · 🚫 HARD_BLOCK
-**File:** `migrations/V1.0.1__add_discount_feature.sql` · **Line:** 14
-
-> If Flyway retries this migration, it will crash with 'column already exists' —
-> exactly what caused the OCDOMAIN-15294 production outage.
-
-**✅ Corrected SQL:**
-```sql
-ALTER TABLE IF EXISTS orders.cpt_order ADD COLUMN IF NOT EXISTS discount_pct NUMERIC(5,2);
-```
-
----
-
-### Finding 2 of 2 — `CREATE INDEX without IF NOT EXISTS` · ⚠️ DBA_REVIEW
-**File:** `migrations/V1.0.1__add_discount_feature.sql` · **Line:** 18
-
-**✅ Corrected SQL:**
-```sql
-CREATE INDEX IF NOT EXISTS idx_cpt_order_discount ON orders.cpt_order(discount_pct);
-```
-```
-
-### Exit code logic
+Reads `review.json`, then:
 
 ```python
 if tier == "HARD_BLOCK":
-    post_review("REQUEST_CHANGES", body)
+    post_review("REQUEST_CHANGES", formatted_body)  # blocks PR
     set_labels("sql-hard-block")
-    sys.exit(1)          # ← fails the GitHub Actions check → merge button disabled
+    sys.exit(1)    # ← CI check fails → merge button disabled
 
 elif tier == "DBA_REVIEW":
-    post_review("REQUEST_CHANGES", body)
+    post_review("REQUEST_CHANGES", formatted_body)  # blocks PR
     set_labels("dba-review-required")
-    sys.exit(0)          # ← check passes but DBA must approve via branch protection
+    sys.exit(0)    # ← CI check passes, DBA must approve
 
 else:  # CLEAN
-    post_review("APPROVE", body)
+    post_review("APPROVE", formatted_body)
     set_labels("sql-scan-clean")
-    sys.exit(0)          # ← check passes, ready to merge
+    sys.exit(0)    # ← CI check passes, ready to merge
 ```
+
+---
+
+## 5. The Rules — copilot-instructions.md
+
+All SQL review rules live in **[.github/copilot-instructions.md](.github/copilot-instructions.md)**.
+The full detailed version with examples is in **[.github/scripts/sql_review_prompt.md](.github/scripts/sql_review_prompt.md)**.
+
+**To add or change a rule:** Edit either file in plain English. No Python. No regex. No code review needed.
+
+### HARD_BLOCK rules (PR check fails)
+
+| # | Rule | Why |
+|---|---|---|
+| 1 | `ADD COLUMN` without `IF NOT EXISTS` (V*.sql) | Flyway retry crash — OCDOMAIN-15294 real incident |
+| 2 | `DROP TABLE` without `IF EXISTS` (V*.sql) | Crash on fresh-env or retry |
+| 3 | `DELETE FROM` without `WHERE` | Wipes entire table |
+| 4 | `UPDATE ... SET` without `WHERE` | Modifies every row |
+| 5 | `TRUNCATE` in V*.sql | Irreversible full-table wipe |
+| 6 | DDL inside `_dml/` file | Violates Confluence DML CICD policy |
+| 7 | Wrong DML filename (not `DM<x.y.z>__<desc>.sql`) | Flyway skips or errors |
+
+### DBA_REVIEW rules (check passes, human required)
+
+| # | Rule | Risk |
+|---|---|---|
+| 8 | `ALTER COLUMN ... TYPE` | Row rewrite + exclusive lock — OCDOMAIN-7659 real revert |
+| 9 | `DROP TABLE / COLUMN / INDEX / VIEW / SCHEMA` | Data loss, breaking dependency |
+| 10 | `DROP ... CASCADE` | Silently removes all dependent objects |
+| 11 | `ALTER COLUMN SET NOT NULL` | Full table scan, exclusive lock |
+| 12 | `ADD COLUMN ... NOT NULL` without `DEFAULT` | Table lock on PG < 11 |
+| 13 | `ALTER SEQUENCE` (non-OWNED) | INCREMENT change broke prod — V2024_0_15 revert |
+| 14 | `CREATE EXTENSION` | Requires superuser |
+| 15 | `RENAME COLUMN / RENAME TO` | Breaking rename — app must change atomically |
+| 16 | `CREATE TABLE` without `IF NOT EXISTS` | Flyway retry fails |
+| 17 | `CREATE INDEX` without `IF NOT EXISTS` | Flyway retry fails |
+| 18 | New table missing audit columns | Policy: all 4 required |
+| 19 | PII column names | Privacy compliance review |
+| 20 | `DELETE/UPDATE` in `/prd/` DML file | Verify WHERE clause scope |
+
+---
+
+## 6. Evaluation Framework
+
+The `evals/` directory contains a **pytest-based AI evaluation suite** that validates the AI reviewer
+detects the right patterns.
+
+### What it tests
+
+```
+evals/
+├── test_sql_reviewer.py      ← 14 parametrized pytest tests
+└── fixtures/
+    ├── hard_block/           ← SQL that MUST trigger HARD_BLOCK
+    │   ├── V_add_column_no_guard.sql
+    │   ├── V_delete_no_where.sql
+    │   ├── V_update_no_where.sql
+    │   ├── V_truncate_versioned.sql
+    │   └── DM1.0.0__ddl_in_dml.sql
+    ├── dba_review/           ← SQL that MUST trigger DBA_REVIEW (not HARD_BLOCK)
+    │   ├── V_alter_column_type.sql
+    │   ├── V_create_index_no_guard.sql
+    │   ├── V_drop_column.sql
+    │   ├── V_alter_sequence.sql
+    │   └── V_missing_audit_columns.sql
+    └── clean/                ← SQL that MUST be CLEAN (no false positives)
+        ├── V_guarded_migration.sql
+        └── R__fn_refresh_order_summary.sql  ← TRUNCATE/DELETE inside function body
+```
+
+### Running evals
+
+```bash
+cd /path/to/sql-review-demo
+export GITHUB_TOKEN=<your-token>
+pip install -r evals/requirements.txt
+pytest evals/test_sql_reviewer.py -v
+```
+
+**Example output:**
+```
+PASSED  test_ai_reviewer_tier[hard_block/V_add_column_no_guard.sql-HARD_BLOCK-ADD COLUMN without IF NOT EXISTS]
+PASSED  test_ai_reviewer_tier[hard_block/V_delete_no_where.sql-HARD_BLOCK-DELETE without WHERE]
+PASSED  test_ai_reviewer_tier[clean/R__fn_refresh_order_summary.sql-CLEAN-TRUNCATE/DELETE inside function body is OK]
+PASSED  test_hard_block_includes_fix
+PASSED  test_function_body_not_flagged
+```
+
+### Adding new eval cases
+
+1. Add a fixture SQL file to `evals/fixtures/hard_block/`, `dba_review/`, or `clean/`
+2. Add one line to `TEST_CASES` in `test_sql_reviewer.py`:
+   ```python
+   ("dba_review/V_my_new_pattern.sql", "DBA_REVIEW", "My new pattern description"),
+   ```
+3. Run `pytest evals/` — if it fails, refine `sql_review_prompt.md`
+
+### Why this approach (over deepeval or promptfoo)
+
+| Framework | Pros | Cons | Our choice? |
+|---|---|---|---|
+| **Custom pytest** | Zero extra dependencies, runs with just `GITHUB_TOKEN`, easy to CI | No UI, no trend tracking | ✅ **Yes** |
+| **deepeval** | Rich metrics (GEval, AnswerRelevancy), CI integration, cloud dashboard | Requires Confident AI account, Python dep | 🔄 Future iteration |
+| **promptfoo** | YAML config, web UI, supports many providers, now part of OpenAI | Node.js dependency, heavier setup | 🔄 Future iteration |
+
+For the initial implementation, custom pytest gives the highest signal/noise ratio.
 
 ---
 
 ## 7. Live Demo PRs
 
-> **Repo:** https://github.com/aadityaks-adusa/sql-review-demo
+### PR #5 — 🚫 HARD_BLOCK
+**ADD COLUMN without IF NOT EXISTS** — the most common real-world Flyway failure.
+AI explains OCDOMAIN-15294 context and provides corrected SQL.
+
+### PR #6 — ⚠️ DBA_REVIEW
+**ALTER COLUMN TYPE + CREATE INDEX without guard + ALTER SEQUENCE** — three DBA_REVIEW patterns.
+AI explains locking risk and the V2024_0_15 sequence revert.
+
+### PR #7 — ✅ CLEAN
+**Full promotions schema** — 3 tables, all guards, all audit columns, repeatable function.
+AI approves with no findings.
 
 ---
 
-### PR #1 — 🚫 HARD_BLOCK · https://github.com/aadityaks-adusa/sql-review-demo/pull/1
-
-**File:** `migrations/V1.0.1__add_discount_feature.sql`
-
-```sql
--- Line 14 ← HARD_BLOCK: missing IF NOT EXISTS
-ALTER TABLE orders.cpt_order ADD COLUMN discount_pct NUMERIC(5,2);
-
--- Line 18 ← DBA_REVIEW: index without guard
-CREATE INDEX idx_cpt_order_discount ON orders.cpt_order(discount_pct);
-```
-
-**Result:** ❌ check fails · label `sql-hard-block` · `REQUEST_CHANGES` with LLM-generated corrected SQL
-
----
-
-### PR #2 — ⚠️ DBA_REVIEW · https://github.com/aadityaks-adusa/sql-review-demo/pull/2
-
-**File:** `migrations/V1.0.2__alter_order_status_type.sql`
-
-```sql
--- ALTER COLUMN TYPE — full table rewrite, exclusive lock
-ALTER TABLE orders.cpt_order ALTER COLUMN status_cd TYPE VARCHAR(50);
-
--- CREATE INDEX without IF NOT EXISTS guard
-CREATE INDEX idx_cpt_order_customer_status ON orders.cpt_order(customer_id, status_cd);
-
--- ALTER SEQUENCE INCREMENT — confirmed real production revert (V2024_0_15 → V2024_0_16)
-ALTER SEQUENCE orders.cpt_order_order_id_seq INCREMENT BY 5;
-```
-
-**Result:** ✅ check passes · label `dba-review-required` · `REQUEST_CHANGES` — DBA must approve
-
----
-
-### PR #3 — ✅ CLEAN · https://github.com/aadityaks-adusa/sql-review-demo/pull/3
-
-**File:** `migrations/V1.0.3__add_order_notes.sql`
-
-```sql
--- All guards present ✅
-ALTER TABLE IF EXISTS orders.cpt_order
-    ADD COLUMN IF NOT EXISTS notes_tx VARCHAR(500);
-
--- All 4 audit columns present ✅
-CREATE TABLE IF NOT EXISTS orders.cpt_cancel_reason (
-    ...
-    audt_cr_dt_tm   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    audt_cr_id      VARCHAR(50) NOT NULL DEFAULT CURRENT_USER,
-    audt_upd_dt_tm  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    audt_upd_id     VARCHAR(50) NOT NULL DEFAULT CURRENT_USER
-);
-
-CREATE INDEX IF NOT EXISTS idx_cpt_order_notes ON orders.cpt_order(notes_tx)
-    WHERE notes_tx IS NOT NULL;
-```
-
-**Result:** ✅ check passes · label `sql-scan-clean` · `APPROVE`
-
----
-
-### PR #4 — 🚫 HARD_BLOCK (mixed) · https://github.com/aadityaks-adusa/sql-review-demo/pull/4
-
-**Three files across two tiers:**
-
-| File | Change | Tier |
-|---|---|---|
-| `migrations/V1.0.4__promotions_and_vouchers.sql` | **Renamed** + 150-line DDL schema | ⚠️ DBA_REVIEW (DROP COLUMN, ALTER COLUMN TYPE, CREATE EXTENSION) |
-| `migrations/R__fn_get_order_totals.sql` | New repeatable PL/pgSQL function | ✅ CLEAN |
-| `cart_dml/DM_deactivate_expired_promos.sql` | New DML — **wrong filename** | 🚫 HARD_BLOCK |
-
-**Why the filename is a HARD_BLOCK:**
-
-```
-Flyway uses filenames to determine migration ordering and versioning.
-"DM_deactivate_expired_promos.sql" doesn't match the required pattern DM<x.y.z>__<desc>.sql
-→ Flyway will silently skip or error at startup.
-
-Required: DM1.0.4__deactivate_expired_promos.sql
-```
-
-**Result:** ❌ check fails (DML naming escalates to HARD_BLOCK) · label `sql-hard-block`
-
----
-
-## 8. Risk Tier Reference
-
-### 🚫 Tier 1 — HARD_BLOCK (PR check fails, merge blocked)
-
-| Pattern | Why blocked |
-|---|---|
-| `ADD COLUMN` without `IF NOT EXISTS` | Flyway retry crash — OCDOMAIN-15294 (real incident) |
-| `DROP TABLE` without `IF EXISTS` | Crash on fresh-env deploy or retry |
-| `DELETE FROM` without `WHERE` | Wipes entire table |
-| `UPDATE ... SET` without `WHERE` | Modifies every row |
-| `TRUNCATE` in a `V*.sql` file | Irreversible full-table wipe |
-| DDL inside a `_dml/` file | Violates Confluence DML CICD policy |
-| Wrong DML filename | Flyway skips or errors on migration |
-
-### ⚠️ Tier 2 — DBA_REVIEW (check passes, human approval required)
-
-| Pattern | Risk |
-|---|---|
-| `ALTER COLUMN ... TYPE` | Row rewrite, exclusive lock — OCDOMAIN-7659 real revert |
-| `DROP COLUMN / TABLE / INDEX / VIEW / SCHEMA` | Data loss, breaking dependency |
-| `DROP ... CASCADE` | Silently removes ALL dependent objects |
-| `ALTER COLUMN SET NOT NULL` | Full table scan, exclusive lock |
-| `CREATE INDEX` without `IF NOT EXISTS` | Fails on retry |
-| `ALTER SEQUENCE` (non-OWNED) | INCREMENT change broke prod — V2024_0_15 revert |
-| `CREATE EXTENSION` | Requires superuser |
-| `RENAME COLUMN / RENAME TO` | Breaking rename — app must change atomically |
-| New `CREATE TABLE` missing audit columns | Policy violation |
-| PII column names (`email`, `ssn`, `phone`, etc.) | Privacy review required |
-
-### ✅ Tier 3 — CLEAN
-
-No flagged patterns. All idempotency guards present. Audit columns included where required.
-
----
-
-## 9. Setup Guide
+## 8. Setup Guide
 
 ### Prerequisites
+- GitHub repository with GitHub Actions enabled
+- Python 3.9+ (ubuntu-latest runner has this built in)
+- GitHub Copilot Enterprise or Pro+ (for Copilot code review)
+- **No API keys needed** — uses built-in `GITHUB_TOKEN`
 
-- GitHub repository
-- Python 3.9+ (ubuntu-latest runner has this)
-- **No additional secrets needed** — uses built-in `GITHUB_TOKEN`
-
-### Step 1 — Copy three scripts
-
-```
-.github/scripts/sql_pr_scan.py
-.github/scripts/llm_reason.py
-.github/scripts/enforce.py
-```
-
-### Step 2 — Add the workflow
+### Step 1 — Copy files
 
 ```
-.github/workflows/sql-pr-scan.yml
+.github/
+  copilot-instructions.md             ← SQL rules for Copilot code review (≤4000 chars)
+  instructions/
+    sql.instructions.md               ← Path-specific instructions for *.sql files
+  workflows/
+    sql-ai-review.yml                 ← 2-step workflow
+  scripts/
+    ai_sql_reviewer.py                ← AI reviewer (replaces scanner + LLM step)
+    sql_review_prompt.md              ← Full system prompt (same rules, no char limit)
+    enforce.py                        ← GitHub REST API enforcer (unchanged)
+evals/
+  test_sql_reviewer.py                ← Pytest evaluation suite
+  requirements.txt
+  fixtures/...                        ← SQL test cases
 ```
 
-Key points in the workflow:
-- `fetch-depth: 0` on checkout — required so `git diff` can see the base commit
-- `if: always()` on Step 3 — enforce runs even if the LLM step fails
-- `permissions: models: read` — grants GitHub Models API access via `GITHUB_TOKEN`
+### Step 2 — Workflow permissions
 
-### Step 3 — Enable branch protection
+```yaml
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  models: read        # ← this is all that's needed for GitHub Models API
+```
+
+### Step 3 — Branch protection
 
 **Settings → Branches → Add rule → `main`**
 
 ```
 ✅ Require status checks to pass before merging
-   Required check:  sql-review / sql-review
-✅ Require branches to be up to date before merging
+   Required check:  sql-ai-review / sql-ai-review
+✅ Require branches to be up to date
 ```
 
-### Step 4 — Open a PR with a `.sql` change
+### Step 4 — Enable Copilot automatic review (optional)
 
-The workflow triggers automatically. Within ~30 seconds:
-1. Scanner results appear in the **Actions → Summary** tab
-2. LLM review appears as a PR review comment from `github-actions[bot]`
-3. Label is applied
-4. Check passes or fails based on tier
+**Settings → Copilot → Code review → Enable automatic code review**
+
+Copilot reads `.github/copilot-instructions.md` and `.github/instructions/sql.instructions.md`
+automatically. No additional configuration needed.
+
+### Step 5 — Run evals to validate your rules
+
+```bash
+export GITHUB_TOKEN=$(gh auth token)
+pip install pytest
+pytest evals/test_sql_reviewer.py -v
+```
+
+All 14 tests should pass. If any fail, adjust `sql_review_prompt.md` accordingly.
 
 ---
 
-## 10. File Reference
+## 9. File Reference
 
 ```
 sql-review-demo/
 │
 ├── .github/
+│   ├── copilot-instructions.md         Rules for Copilot code review (≤4000 chars)
+│   │                                   Also referenced as system prompt basis
+│   │
+│   ├── instructions/
+│   │   └── sql.instructions.md         Path-specific instructions for *.sql files
+│   │                                   (applyTo: **/*.sql)
+│   │
 │   ├── workflows/
-│   │   └── sql-pr-scan.yml              3-step GitHub Actions workflow
+│   │   └── sql-ai-review.yml           2-step workflow: AI review → enforce
 │   │
 │   └── scripts/
-│       ├── sql_pr_scan.py               Layer 1 — 25 regex rules, context-aware
-│       │                                Output: /tmp/findings.json
+│       ├── ai_sql_reviewer.py          Step 1 — AI reviewer
+│       │                               Input:  git diff + sql_review_prompt.md
+│       │                               Output: /tmp/review.json
+│       │                               Python role: diff + file type from path only
 │       │
-│       ├── llm_reason.py                Layer 2 — GitHub Models API (gpt-4o-mini)
-│       │                                Input:  /tmp/findings.json + git diff
-│       │                                Output: /tmp/review.json
+│       ├── sql_review_prompt.md        Full system prompt (all rules, no char limit)
+│       │                               Single source of truth for SQL review logic
 │       │
-│       └── enforce.py                   Layer 3 — GitHub REST API enforcer
-│                                        Input:  /tmp/review.json
-│                                        Output: PR review + label + exit code
+│       └── enforce.py                  Step 2 — GitHub REST API enforcer
+│                                       Input:  /tmp/review.json
+│                                       Output: PR review + label + exit code
+│
+├── evals/
+│   ├── test_sql_reviewer.py            14 pytest tests for AI correctness
+│   ├── requirements.txt                pytest only
+│   └── fixtures/
+│       ├── hard_block/                 5 SQL files that must trigger HARD_BLOCK
+│       ├── dba_review/                 5 SQL files that must trigger DBA_REVIEW
+│       └── clean/                      2 SQL files that must be CLEAN (no false positives)
 │
 └── migrations/
-    ├── V1.0.0__create_orders_schema.sql      Clean baseline
-    ├── V1.0.1__add_discount_feature.sql      PR #1 — HARD_BLOCK demo
-    ├── V1.0.2__alter_order_status_type.sql   PR #2 — DBA_REVIEW demo
-    ├── V1.0.3__add_order_notes.sql           PR #3 — CLEAN demo
-    ├── V1.0.4__promotions_and_vouchers.sql   PR #4 — mixed / big refactor demo
-    └── R__fn_get_order_totals.sql            PR #4 — repeatable function demo
+    └── V1.0.0__create_orders_schema.sql   Clean baseline on main
 ```
 
-### Data contracts between layers
-
-**`findings.json`** (Layer 1 → Layer 2):
-
-```json
-[
-  {
-    "file":         "relative path to the SQL file",
-    "file_type":    "DDL_versioned | DDL_repeatable | DML | OTHER",
-    "line_number":  "integer, 1-based",
-    "line_content": "raw SQL line from the diff",
-    "pattern":      "rule name e.g. ADD COLUMN without IF NOT EXISTS",
-    "description":  "technical explanation of the risk",
-    "tier":         "HARD_BLOCK | DBA_REVIEW"
-  }
-]
-```
-
-**`review.json`** (Layer 2 → Layer 3):
+### `review.json` schema (contract between Step 1 and Step 2)
 
 ```json
 {
   "overall_tier": "HARD_BLOCK | DBA_REVIEW | CLEAN",
-  "summary":      "1-2 sentence overall assessment",
+  "summary":      "1-2 sentence assessment",
   "findings": [
     {
-      "file":    "relative path",
-      "line":    "integer, 1-based",
-      "pattern": "rule name",
-      "risk":    "plain-English risk explanation (LLM-generated)",
-      "fix":     "corrected SQL statement (LLM-generated)"
+      "file":    "relative path to SQL file",
+      "line":    42,
+      "pattern": "rule name (e.g. ADD COLUMN without IF NOT EXISTS)",
+      "tier":    "HARD_BLOCK | DBA_REVIEW",
+      "risk":    "plain-English explanation (AI-generated)",
+      "fix":     "complete corrected SQL statement (AI-generated)"
     }
   ]
 }
@@ -641,6 +474,6 @@ sql-review-demo/
 
 ---
 
-> **Built for the Coreservices Database Deployments platform.**
-> Scanner rules derived from analysis of 1,190 commits across all branches and 429 SQL files.
-> Real incidents referenced: OCDOMAIN-15294 (ADD COLUMN), OCDOMAIN-7659 (ALTER COLUMN TYPE), V2024_0_15 (ALTER SEQUENCE).
+> **Built for Coreservices Database Deployments.**
+> Rules derived from 1,190 commits, 429 SQL files, and real incidents: OCDOMAIN-15294, OCDOMAIN-7659, V2024_0_15.
+> Redesigned based on feedback: AI-first, no hardcoded rules, Copilot-powered, eval-validated.
