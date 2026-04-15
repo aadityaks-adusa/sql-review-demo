@@ -9,11 +9,56 @@ on:
 # Permissions required for posting reviews, labels, and GitHub Models API
 permissions:
   contents: read
-  pull-requests: write    # post PR reviews (REQUEST_CHANGES / APPROVE)
+  pull-requests: write    # post PR reviews (REQUEST_CHANGES / APPROVE) + request reviewers
   issues: write           # add labels
   models: read            # GitHub Models API via GITHUB_TOKEN — no extra secrets needed
 
 jobs:
+
+  # ---------------------------------------------------------------------------
+  # JOB 0 — Request GitHub Copilot as a formal PR reviewer
+  #
+  # This makes Copilot appear in the "Reviewers" panel (not as a conversation
+  # comment) and post inline review comments directly on the diff lines.
+  # Copilot reads .github/copilot-instructions.md and
+  # .github/instructions/sql.instructions.md automatically.
+  #
+  # If the API call fails (Copilot review not enabled on this repo/org plan),
+  # enable it via: Settings → Rules → Rulesets → "Automatically request
+  # Copilot code review" — that's the official native configuration path.
+  # ---------------------------------------------------------------------------
+  request-copilot-review:
+    name: Request Copilot as reviewer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add github-copilot[bot] to reviewers
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request.number;
+            core.info(`Requesting Copilot review on PR #${pr}`);
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                pull_number: pr,
+                reviewers: ['Copilot'],
+              });
+              core.info('✅ Copilot review requested — check the Reviewers panel');
+            } catch (err) {
+              // Non-fatal: Copilot review may already be configured via Rulesets,
+              // or the plan may not allow API-based reviewer assignment.
+              core.warning('⚠️  Could not request Copilot via API: ' + err.message);
+              core.warning('Enable automatic Copilot review via repo Settings → Rules → Rulesets');
+            }
+
+  # ---------------------------------------------------------------------------
+  # JOB 1 — AI enforcement pipeline (GitHub Models GPT-4o → enforce.py)
+  #
+  # Copilot's review is advisory (COMMENT-type, cannot block merges).
+  # This job runs the same rules through GPT-4o and posts a blocking
+  # REQUEST_CHANGES review for HARD_BLOCK issues — that's the enforcement gate.
+  # ---------------------------------------------------------------------------
   sql-ai-review:
     name: sql-ai-review
     runs-on: ubuntu-latest
