@@ -1,117 +1,110 @@
 #!/usr/bin/env python3
 """
-SQL AI Reviewer — AI-Only Pipeline
-Coreservices Database Deployments
+AI SQL Reviewer — Coreservices Database Deployments
+Replaces sql_pr_scan.py with a pure AI review pass using GitHub Models (GPT-4o).
 
-Replaces the old 3-step pipeline (sql_pr_scan.py → llm_reason.py → enforce.py)
-with a single AI pass.
+Python's role here is ONLY:
+  1. Retrieve the git diff for changed SQL files
+  2. Classify each file by path/name (not by SQL parsing)
+  3. Call the GitHub Models API with the full diff + rule system prompt
+  4. Write the structured review.json for enforce.py to consume
 
-Design philosophy:
-  - NO hardcoded SQL regex rules in Python
-  - ALL SQL analysis is performed by GitHub Models (GPT-4o)
-  - Python is responsible ONLY for: getting the diff, classifying file types
-    from the path, calling the API, and writing review.json
-  - Rules live in sql_review_prompt.md (human-readable, editable by anyone)
-  - The same rules power GitHub Copilot code review via .github/copilot-instructions.md
+ALL SQL analysis is done by GPT-4o. Zero hardcoded regex rules.
 
-Input:
-  - Git diff between BASE_SHA and HEAD_SHA
-  - sql_review_prompt.md (system prompt)
+Outputs:
+  $SQL_REVIEW_OUTPUT (default: /tmp/review.json)
+  GitHub Actions step summary
+  Exit code always 0 — enforce.py owns the exit code
 
-Output:
-  - /tmp/review.json: {overall_tier, summary, findings: [{file, line, pattern, tier, risk, fix}]}
-  - GitHub Actions step summary
-  - Exit 0 always (enforce.py owns the exit code)
+Environment variables:
+  GITHUB_TOKEN  — automatically set in GitHub Actions (models: read permission required)
+  BASE_SHA      — base commit SHA (github.event.pull_request.base.sha)
+  HEAD_SHA      — head commit SHA (github.event.pull_request.head.sha)
+  SQL_REVIEW_OUTPUT — path to write review.json (default: /tmp/review.json)
 
-Fallback:
-  - If the GitHub Models API is unavailable, the PR is blocked as a safety measure.
+Usage:
+  python3 .github/scripts/ai_sql_reviewer.py
 """
 
-import os
-import re
-import sys
 import json
+import os
 import subprocess
+import sys
 import urllib.request
 import urllib.error
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Environment
+# Configuration
 # ---------------------------------------------------------------------------
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-BASE_SHA     = os.environ.get("BASE_SHA", "origin/main")
-HEAD_SHA     = os.environ.get("HEAD_SHA", "HEAD")
-REVIEW_FILE  = os.environ.get("SQL_REVIEW_OUTPUT", "/tmp/review.json")
+GITHUB_MODELS_ENDPOINT = "https://models.github.ai/inference/chat/completions"
+MODEL = "openai/gpt-4o"
+GITHUB_API_VERSION = "2026-03-10"
+MAX_DIFF_CHARS = 30_000  # cap to stay within context window
+TEMPERATURE = 0.1        # near-deterministic for compliance review
 
-# GitHub Models endpoint — uses built-in GITHUB_TOKEN, no extra secrets needed
-MODELS_URL = "https://models.inference.ai.azure.com/chat/completions"
-MODEL      = "gpt-4o"   # GPT-4o for stronger reasoning than gpt-4o-mini
-
-SCRIPT_DIR  = Path(__file__).parent
+SCRIPT_DIR = Path(__file__).parent
 PROMPT_FILE = SCRIPT_DIR / "sql_review_prompt.md"
+OUTPUT_FILE = Path(os.environ.get("SQL_REVIEW_OUTPUT", "/tmp/review.json"))
 
 
 # ---------------------------------------------------------------------------
-# File type classification — path-based only, no SQL parsing
+# File-type classification (path only — no SQL parsing)
 # ---------------------------------------------------------------------------
 
 def classify_file(path: str) -> str:
     """
-    Classify SQL file type from its path and filename only.
-    This is the ONLY place Python makes decisions about SQL — purely from the filename.
-    All actual SQL analysis is delegated to the AI.
+    Classify a SQL file by its name and path — no SQL content inspection.
+    Returns one of: DDL_versioned | DDL_repeatable | DML | DML_production | OTHER
     """
     p = Path(path)
-    parts = p.parts
-    name  = p.name
+    name = p.name
+    parts = [part.lower() for part in p.parts]
 
-    # DML: lives in a *_dml/ folder OR filename starts with DM
-    if any(part.endswith("_dml") for part in parts) or name.startswith("DM"):
-        return "DML_production" if "prd" in parts else "DML"
+    is_prod = "prd" in parts and not ("nonprd" in parts)
+    in_dml_folder = any(part.endswith("_dml") for part in parts)
+    is_dm_file = name.startswith("DM")
 
-    # Repeatable DDL: R__*.sql
-    if name.startswith("R__") and name.endswith(".sql"):
-        return "DDL_repeatable"
-
-    # Versioned DDL: V*.sql
+    if in_dml_folder or is_dm_file:
+        return "DML_production" if is_prod else "DML"
     if name.startswith("V") and name.endswith(".sql"):
         return "DDL_versioned"
-
+    if name.startswith("R__") and name.endswith(".sql"):
+        return "DDL_repeatable"
     return "OTHER"
 
 
 # ---------------------------------------------------------------------------
-# Git helpers
+# Git diff helpers
 # ---------------------------------------------------------------------------
 
 def get_changed_sql_files() -> list[str]:
-    """Returns SQL files changed in this PR via git diff."""
+    base = os.environ.get("BASE_SHA", "HEAD~1")
+    head = os.environ.get("HEAD_SHA", "HEAD")
     try:
         result = subprocess.run(
-            ["git", "diff", "--name-only", "--diff-filter=ACMR", BASE_SHA, HEAD_SHA],
+            ["git", "diff", "--name-only", "--diff-filter=ACM", base, head],
             capture_output=True, text=True, check=True,
         )
-        return [f.strip() for f in result.stdout.splitlines() if f.strip().endswith(".sql")]
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: git diff failed: {e.stderr}", file=sys.stderr)
-        sys.exit(1)
+        return [f for f in result.stdout.strip().splitlines() if f.endswith(".sql")]
+    except subprocess.CalledProcessError as exc:
+        print(f"[ai_sql_reviewer] git diff failed: {exc.stderr}", file=sys.stderr)
+        return []
 
 
-def get_diff() -> str:
-    """Returns the full unified diff for the PR, capped to stay within token budget."""
+def get_diff(base: str, head: str) -> str:
     try:
         result = subprocess.run(
-            ["git", "diff", BASE_SHA, HEAD_SHA, "--unified=5"],
+            ["git", "diff", "--unified=5", base, head, "--", "*.sql"],
             capture_output=True, text=True, check=True,
         )
         diff = result.stdout
-        if len(diff) > 25000:
-            print(f"Diff truncated: {len(diff)} → 25000 chars")
-            diff = diff[:25000] + "\n\n[... diff truncated — see full diff in GitHub UI ...]"
+        if len(diff) > MAX_DIFF_CHARS:
+            diff = diff[:MAX_DIFF_CHARS] + "\n\n[diff truncated — review full file for context]"
         return diff
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
+        print(f"[ai_sql_reviewer] git diff (content) failed: {exc.stderr}", file=sys.stderr)
         return ""
 
 
@@ -120,112 +113,93 @@ def get_diff() -> str:
 # ---------------------------------------------------------------------------
 
 def load_system_prompt() -> str:
-    """
-    Load the SQL review rules from sql_review_prompt.md.
-    This file is the single source of truth for all review rules.
-    """
     if PROMPT_FILE.exists():
         return PROMPT_FILE.read_text(encoding="utf-8")
-
-    # Should not happen in normal operation — hard fail so we notice
-    print(f"ERROR: System prompt not found at {PROMPT_FILE}", file=sys.stderr)
-    sys.exit(1)
+    # Fallback inline prompt if file is missing
+    return (
+        "You are a strict SQL migration code reviewer for a PostgreSQL + Flyway repository. "
+        "Classify every issue as HARD_BLOCK or DBA_REVIEW. "
+        "Respond ONLY with valid JSON matching the schema: "
+        '{"overall_tier":"HARD_BLOCK|DBA_REVIEW|CLEAN","summary":"string","findings":['
+        '{"file":"string","line":0,"pattern":"string","tier":"HARD_BLOCK|DBA_REVIEW","risk":"string","fix":"string"}]}'
+    )
 
 
 # ---------------------------------------------------------------------------
 # GitHub Models API call
 # ---------------------------------------------------------------------------
 
-def call_ai_reviewer(files: list[str], diff: str) -> dict:
-    """
-    Calls GitHub Models (GPT-4o) with the full diff and file context.
-    Returns the structured review dict.
-    """
+def call_ai_reviewer(files_info: list[dict], diff: str) -> dict:
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        return _safety_block(files_info, "GITHUB_TOKEN not set — cannot call AI reviewer")
+
     system_prompt = load_system_prompt()
 
-    # Build file context — all path-based, no SQL analysis
-    file_context_lines = [
-        f"  - {f}  [type: {classify_file(f)}]"
-        for f in files
-    ]
-    file_context = "\n".join(file_context_lines)
-
+    files_block = "\n".join(
+        f"  - {f['path']}  [type: {f['type']}]" for f in files_info
+    )
     user_message = (
-        f"## Changed SQL files in this PR\n\n"
-        f"{file_context}\n\n"
-        f"## Full git diff\n\n"
-        f"```diff\n{diff}\n```\n\n"
-        f"Review all SQL changes above according to the system prompt rules.\n"
-        f"Classify each issue. If no issues found, return CLEAN with an empty findings array."
+        f"Changed SQL files:\n{files_block}\n\n"
+        f"Full git diff:\n```diff\n{diff}\n```\n\n"
+        "Review the diff and respond with valid JSON only."
     )
 
-    payload = {
+    payload = json.dumps({
         "model": MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_message},
         ],
-        "temperature": 0.1,      # near-deterministic for consistent classification
-        "max_tokens":  4000,
+        "temperature": TEMPERATURE,
+        "max_tokens": 4000,
         "response_format": {"type": "json_object"},
-    }
+    }).encode("utf-8")
 
-    data = json.dumps(payload).encode("utf-8")
-    req  = urllib.request.Request(
-        MODELS_URL, data=data,
+    req = urllib.request.Request(
+        GITHUB_MODELS_ENDPOINT,
+        data=payload,
         headers={
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
         },
         method="POST",
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            raw     = json.loads(resp.read().decode("utf-8"))
-            content = raw["choices"][0]["message"]["content"]
-            review  = json.loads(content)
-            tier    = review.get("overall_tier", "UNKNOWN")
-            count   = len(review.get("findings", []))
-            print(f"AI review complete: overall_tier={tier}, findings={count}")
-            return review
-
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8")
-        print(f"GitHub Models API HTTP error {e.code}: {body}", file=sys.stderr)
-        return _safety_block(files, f"GitHub Models API returned {e.code}")
-
-    except json.JSONDecodeError as e:
-        print(f"AI returned invalid JSON: {e}", file=sys.stderr)
-        return _safety_block(files, "AI response was not valid JSON")
-
-    except Exception as e:
-        print(f"AI reviewer failed ({type(e).__name__}): {e}", file=sys.stderr)
-        return _safety_block(files, str(e))
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            content = body["choices"][0]["message"]["content"]
+            return json.loads(content)
+    except urllib.error.HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace")
+        print(f"[ai_sql_reviewer] API HTTP error {exc.code}: {err}", file=sys.stderr)
+        return _safety_block(files_info, f"GitHub Models API returned HTTP {exc.code}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ai_sql_reviewer] API call failed: {exc}", file=sys.stderr)
+        return _safety_block(files_info, f"AI reviewer unavailable: {exc}")
 
 
-def _safety_block(files: list[str], reason: str) -> dict:
-    """
-    Returned when the AI is unavailable.
-    Blocks the PR as a safety measure — an unreviewed SQL migration should not merge.
-    """
+def _safety_block(files_info: list[dict], reason: str) -> dict:
+    """Return a HARD_BLOCK review when the AI is unavailable. Fail closed, not open."""
     return {
         "overall_tier": "HARD_BLOCK",
         "summary": (
-            f"🚨 AI SQL review could not complete: {reason}. "
-            "The PR has been blocked as a safety measure. "
-            "Re-push to trigger a fresh review, or contact the platform team if the issue persists."
+            f"AI review could not be completed: {reason}. "
+            "Blocking as a precaution — manual DBA review required before merge."
         ),
         "findings": [
             {
-                "file": f,
+                "file": f["path"],
                 "line": 0,
                 "pattern": "AI review unavailable",
                 "tier": "HARD_BLOCK",
-                "risk": "The AI reviewer could not complete. SQL migrations must be reviewed before merging.",
-                "fix": "Re-push to trigger a fresh workflow run.",
+                "risk": reason,
+                "fix": "Ensure GITHUB_TOKEN has 'models: read' permission and retry.",
             }
-            for f in files
+            for f in files_info
         ],
     }
 
@@ -234,104 +208,89 @@ def _safety_block(files: list[str], reason: str) -> dict:
 # GitHub Actions step summary
 # ---------------------------------------------------------------------------
 
-def build_step_summary(review: dict) -> str:
-    tier     = review.get("overall_tier", "CLEAN")
-    summary  = review.get("summary", "")
+def build_step_summary(review: dict, files_info: list[dict]) -> str:
+    tier = review.get("overall_tier", "UNKNOWN")
+    summary = review.get("summary", "")
     findings = review.get("findings", [])
 
-    emoji = {"HARD_BLOCK": "🚫", "DBA_REVIEW": "⚠️", "CLEAN": "✅"}.get(tier, "❓")
-    label = {
-        "HARD_BLOCK": "BLOCKED — must fix before merge",
-        "DBA_REVIEW": "DBA Review Required",
-        "CLEAN": "Clean — approved",
-    }.get(tier, tier)
-
+    tier_emoji = {"HARD_BLOCK": "🚫", "DBA_REVIEW": "⚠️", "CLEAN": "✅"}.get(tier, "❓")
     lines = [
-        f"## {emoji} SQL AI Review — {label}",
+        f"## {tier_emoji} SQL AI Review — {tier}",
         "",
-        summary,
+        f"**Model:** {MODEL}  |  **Files reviewed:** {len(files_info)}",
         "",
-        "---",
+        f"> {summary}" if summary else "",
         "",
     ]
 
     if findings:
-        lines += [
-            "### Findings",
-            "",
-            "| File | Line | Pattern | Tier |",
-            "|------|------|---------|------|",
-        ]
+        lines += ["### Findings", ""]
         for f in findings:
             t_emoji = "🚫" if f.get("tier") == "HARD_BLOCK" else "⚠️"
-            fname   = Path(f.get("file", "")).name
-            line    = f.get("line", "—") or "—"
-            pattern = f.get("pattern", "")
-            tier_f  = f.get("tier", "")
-            lines.append(f"| `{fname}` | {line} | **{pattern}** | {t_emoji} {tier_f} |")
+            lines.append(f"#### {t_emoji} `{f.get('file', '?')}` — line {f.get('line', '?')}")
+            lines.append(f"**Pattern:** {f.get('pattern', '?')}  ")
+            lines.append(f"**Risk:** {f.get('risk', '')}  ")
+            fix = f.get("fix", "")
+            if fix:
+                lines += ["**Fix:**", "```sql", fix, "```"]
+            lines.append("")
     else:
-        lines.append("No issues found. All SQL changes look good.")
-
-    lines += [
-        "",
-        "---",
-        "",
-        "> *Reviewed by GitHub Models (GPT-4o) — AI-Only SQL Review*",
-        "> *Rules: `.github/copilot-instructions.md` · System prompt: `.github/scripts/sql_review_prompt.md`*",
-        "> *GitHub Copilot code review uses the same rules for inline PR comments.*",
-    ]
+        lines.append("No findings — SQL changes look clean.")
 
     return "\n".join(lines)
-
-
-def _write_step_summary(text: str):
-    path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if path:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(text + "\n")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    if not GITHUB_TOKEN:
-        print("ERROR: GITHUB_TOKEN is required.", file=sys.stderr)
-        sys.exit(1)
+def main() -> None:
+    base = os.environ.get("BASE_SHA", "HEAD~1")
+    head = os.environ.get("HEAD_SHA", "HEAD")
 
-    files = get_changed_sql_files()
-
-    if not files:
-        print("No SQL files changed in this PR.")
+    sql_files = get_changed_sql_files()
+    if not sql_files:
+        print("[ai_sql_reviewer] No SQL files changed — writing CLEAN review")
         review = {
             "overall_tier": "CLEAN",
-            "summary": "No SQL files changed in this PR.",
+            "summary": "No SQL files changed in this pull request.",
             "findings": [],
         }
-        with open(REVIEW_FILE, "w", encoding="utf-8") as fh:
-            json.dump(review, fh, indent=2)
-        _write_step_summary("## ✅ SQL AI Review — Clean\n\nNo SQL files changed in this PR.")
+        OUTPUT_FILE.write_text(json.dumps(review, indent=2), encoding="utf-8")
+        _write_step_summary(build_step_summary(review, []))
         return
 
-    print(f"Reviewing {len(files)} SQL file(s):")
-    for f in files:
-        print(f"  {f}  [{classify_file(f)}]")
+    files_info = [{"path": f, "type": classify_file(f)} for f in sql_files]
+    print(f"[ai_sql_reviewer] Reviewing {len(files_info)} SQL file(s) via {MODEL}...")
+    for fi in files_info:
+        print(f"  {fi['type']:20s}  {fi['path']}")
 
-    diff   = get_diff()
-    review = call_ai_reviewer(files, diff)
+    diff = get_diff(base, head)
+    if not diff:
+        review = _safety_block(files_info, "Could not retrieve git diff")
+    else:
+        review = call_ai_reviewer(files_info, diff)
 
-    # Write review.json for enforce.py
-    with open(REVIEW_FILE, "w", encoding="utf-8") as fh:
-        json.dump(review, fh, indent=2)
-    print(f"Written: {REVIEW_FILE}")
+    # Validate and normalise tier
+    valid_tiers = {"HARD_BLOCK", "DBA_REVIEW", "CLEAN"}
+    if review.get("overall_tier") not in valid_tiers:
+        review["overall_tier"] = "HARD_BLOCK"
+        review["summary"] = "AI returned an unexpected response structure. Blocking as a precaution."
 
-    # Write step summary
-    _write_step_summary(build_step_summary(review))
+    OUTPUT_FILE.write_text(json.dumps(review, indent=2), encoding="utf-8")
+    print(f"[ai_sql_reviewer] Review written to {OUTPUT_FILE}")
+    print(f"[ai_sql_reviewer] Overall tier: {review['overall_tier']}")
 
-    # Exit 0 always — enforce.py owns the exit code and PR blocking decision
-    sys.exit(0)
+    _write_step_summary(build_step_summary(review, files_info))
+
+
+def _write_step_summary(content: str) -> None:
+    summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "")
+    if summary_file:
+        with open(summary_file, "a", encoding="utf-8") as fh:
+            fh.write(content + "\n")
 
 
 if __name__ == "__main__":
     main()
+    sys.exit(0)  # enforce.py owns the exit code

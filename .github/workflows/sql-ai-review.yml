@@ -1,39 +1,76 @@
-name: SQL AI Review — Copilot-Powered
+# Owned by ADUSA-Digital Platform Engineering
+# Version: 2.0.0 — Updated April 2026
+# SQL AI Review — AI-first SQL PR review pipeline using GitHub Models (GPT-4o).
+#
+# NO hardcoded regex rules. All SQL analysis is done by the AI.
+# Rules live in plain English in:
+#   .github/copilot-instructions.md  (Copilot code review — ≤4000 chars)
+#   .github/instructions/sql.instructions.md  (per-rule detail table — easy to edit)
+#   .github/scripts/sql_review_prompt.md  (full system prompt for GPT-4o)
+#
+# Two parallel tracks:
+#   Track A: GitHub Copilot code review — posts inline comments as a formal PR reviewer
+#            (Copilot always posts COMMENT-type; cannot block merges — this is a platform limit)
+#   Track B: GitHub Models GPT-4o → enforce.py → REQUEST_CHANGES + exit 1 on HARD_BLOCK
+#            This is the enforcement gate that can actually block merges.
+#
+# Tier 1 (HARD_BLOCK): PR check fails (exit 1)
+# Tier 2 (DBA_REVIEW): PR check passes, DBA required (EDA team + label)
+# Tier 3 (CLEAN):      PR check passes, auto-approve eligible
+#
+# Rules derived from analysis of 1,190 commits across all branches and 429 SQL files.
+# See .github/docs/SQL_PR_Review_Automation_Confluence.md for full rule reasoning.
+
+name: sql-pr-scan
 
 on:
   pull_request:
-    paths: ["**/*.sql"]
-    branches: [main]
-    types: [opened, synchronize, reopened]
+    branches:
+      - main
+      - develop
+      - 'release/**'
+      - 'hotfix/**'
+    paths:
+      - '**/*.sql'
 
-# Permissions required for posting reviews, labels, and GitHub Models API
 permissions:
   contents: read
-  pull-requests: write    # post PR reviews (REQUEST_CHANGES / APPROVE) + request reviewers
+  pull-requests: write    # post PR reviews + request reviewers
   issues: write           # add labels
-  models: read            # GitHub Models API via GITHUB_TOKEN — no extra secrets needed
+  models: read            # GitHub Models API — no extra secrets needed
 
 jobs:
 
   # ---------------------------------------------------------------------------
-  # JOB 0 — Request GitHub Copilot as a formal PR reviewer
+  # JOB 1 — Request GitHub Copilot as a formal PR reviewer
   #
-  # This makes Copilot appear in the "Reviewers" panel (not as a conversation
-  # comment) and post inline review comments directly on the diff lines.
-  # Copilot reads .github/copilot-instructions.md and
-  # .github/instructions/sql.instructions.md automatically.
+  # Copilot appears in the Reviewers panel (same as a human reviewer) and posts
+  # inline review comments on the diff lines, guided by:
+  #   .github/copilot-instructions.md
+  #   .github/instructions/sql.instructions.md  (applyTo: **/*.sql)
   #
-  # If the API call fails (Copilot review not enabled on this repo/org plan),
-  # enable it via: Settings → Rules → Rulesets → "Automatically request
-  # Copilot code review" — that's the official native configuration path.
+  # Platform limitation: Copilot always posts COMMENT-type reviews, not
+  # REQUEST_CHANGES. It cannot block merges. Job 2 (enforce) is the gate.
+  #
+  # If this call fails (Copilot review not enabled on the repo/plan), enable it
+  # natively: Settings → Rules → Rulesets → "Automatically request Copilot code review"
   # ---------------------------------------------------------------------------
   request-copilot-review:
     name: Request Copilot as reviewer
     runs-on: ubuntu-latest
     steps:
+      - name: Get App token
+        uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ secrets.READONLY_INTERNAL_APP_ID }}
+          private-key: ${{ secrets.READONLY_INTERNAL_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+
       - name: Add github-copilot[bot] to reviewers
         uses: actions/github-script@v7
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const pr = context.payload.pull_request.number;
             core.info(`Requesting Copilot review on PR #${pr}`);
@@ -46,36 +83,46 @@ jobs:
               });
               core.info('✅ Copilot review requested — check the Reviewers panel');
             } catch (err) {
-              // Non-fatal: Copilot review may already be configured via Rulesets,
-              // or the plan may not allow API-based reviewer assignment.
               core.warning('⚠️  Could not request Copilot via API: ' + err.message);
-              core.warning('Enable automatic Copilot review via repo Settings → Rules → Rulesets');
+              core.warning('Enable via: Settings → Rules → Rulesets → Automatically request Copilot code review');
             }
 
   # ---------------------------------------------------------------------------
-  # JOB 1 — AI enforcement pipeline (GitHub Models GPT-4o → enforce.py)
+  # JOB 2 — AI enforcement pipeline
   #
-  # Copilot's review is advisory (COMMENT-type, cannot block merges).
-  # This job runs the same rules through GPT-4o and posts a blocking
-  # REQUEST_CHANGES review for HARD_BLOCK issues — that's the enforcement gate.
+  # Step 1: ai_sql_reviewer.py — calls GitHub Models GPT-4o with the full diff
+  #         and the sql_review_prompt.md system prompt. No hardcoded SQL regex.
+  #         Python only does path-based file type classification + git diff retrieval.
+  #         Output: /tmp/review.json
+  #
+  # Step 2: enforce.py — reads review.json, posts a formal GitHub PR review
+  #         (REQUEST_CHANGES or APPROVE), adds labels, exits 1 on HARD_BLOCK.
+  #
+  # Safety: if the AI is unavailable → HARD_BLOCK (not silent pass-through).
   # ---------------------------------------------------------------------------
   sql-ai-review:
-    name: sql-ai-review
+    name: SQL AI Review
     runs-on: ubuntu-latest
 
     steps:
-      # Full history required so git diff can see the base commit
       - name: Checkout (full history)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # -----------------------------------------------------------------------
-      # STEP 1 — AI Review
-      # GitHub Models (GPT-4o) reads the full diff and applies the SQL rules
-      # from .github/scripts/sql_review_prompt.md (same rules as copilot-instructions.md)
-      # Output: /tmp/review.json
-      # -----------------------------------------------------------------------
+      - name: Get App token
+        uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ secrets.READONLY_INTERNAL_APP_ID }}
+          private-key: ${{ secrets.READONLY_INTERNAL_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: "Step 1 — AI SQL Review (GitHub Models · GPT-4o)"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -84,15 +131,10 @@ jobs:
           SQL_REVIEW_OUTPUT: /tmp/review.json
         run: python3 .github/scripts/ai_sql_reviewer.py
 
-      # -----------------------------------------------------------------------
-      # STEP 2 — Enforce
-      # Reads review.json → posts PR review → adds label → exits 1 on HARD_BLOCK
-      # Runs even if Step 1 fails (safety block)
-      # -----------------------------------------------------------------------
       - name: "Step 2 — Enforce (post review · label · gate)"
         if: always()
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           SQL_SCAN_REVIEW_FILE: /tmp/review.json
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}

@@ -1,252 +1,148 @@
 #!/usr/bin/env python3
 """
-SQL PR Enforce — Enforcement Step
-Reads review.json and calls the GitHub REST API to:
-  - Post a PR review (REQUEST_CHANGES or APPROVE)
-  - Add labels (sql-hard-block | dba-review-required | sql-scan-clean)
-  - Exit 1 on HARD_BLOCK to fail the required CI check
+Enforce — reads review.json from ai_sql_reviewer.py and posts a formal GitHub PR review.
 
-If review.json is missing (LLM step crashed), falls back to findings.json.
+Actions taken:
+  HARD_BLOCK  → POST REQUEST_CHANGES review, add sql-hard-block label, exit 1 (CI fails)
+  DBA_REVIEW  → POST REQUEST_CHANGES review, add dba-review-required label, exit 0
+  CLEAN       → POST APPROVE review, add sql-scan-clean label, exit 0
+
+Environment variables:
+  GITHUB_TOKEN          — token with pull-requests: write and issues: write
+  SQL_SCAN_REVIEW_FILE  — path to review.json (default: /tmp/review.json)
+  PR_NUMBER             — pull request number
+  REPO                  — owner/repo string (e.g. ADUSA-Digital/pdl-coreservices-database-deployments)
 """
 
+import json
 import os
 import sys
-import json
 import urllib.request
 import urllib.error
-import urllib.parse
 
-REVIEW_FILE   = os.environ.get("SQL_SCAN_REVIEW_FILE",   "/tmp/review.json")
-FINDINGS_FILE = os.environ.get("SQL_SCAN_FINDINGS_FILE", "/tmp/findings.json")
-GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
-PR_NUMBER     = os.environ.get("PR_NUMBER", "")
-REPO          = os.environ.get("REPO", "")   # owner/repo
-
-API = "https://api.github.com"
+REVIEW_FILE = os.environ.get("SQL_SCAN_REVIEW_FILE", "/tmp/review.json")
+GH_API = "https://api.github.com"
+TOKEN = os.environ.get("GITHUB_TOKEN", "")
+REPO = os.environ.get("REPO", os.environ.get("GITHUB_REPOSITORY", ""))
+PR_NUMBER = os.environ.get("PR_NUMBER", "")
 
 
-# ---------------------------------------------------------------------------
-# GitHub API helpers
-# ---------------------------------------------------------------------------
-
-def _gh(method: str, path: str, body: dict = None) -> dict:
-    url  = f"{API}{path}"
-    data = json.dumps(body).encode() if body else None
-    req  = urllib.request.Request(
-        url, data=data,
+def gh_post(path: str, payload: dict) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{GH_API}{path}",
+        data=data,
         headers={
-            "Authorization":        f"Bearer {GITHUB_TOKEN}",
-            "Accept":               "application/vnd.github+json",
+            "Authorization": f"Bearer {TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "Content-Type":         "application/json",
-            "User-Agent":           "sql-review-bot/1.0",
         },
-        method=method,
+        method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            content = resp.read()
-            return json.loads(content) if content else {}
-    except urllib.error.HTTPError as e:
-        msg = e.read().decode()
-        print(f"GitHub API {method} {path} → {e.code}: {msg}", file=sys.stderr)
-        return {"_error": e.code, "_body": msg}
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        print(f"[enforce] GitHub API {exc.code} on {path}: {body}", file=sys.stderr)
+        return {}
 
 
-def ensure_label(name: str, color: str, description: str):
-    existing = _gh("GET", f"/repos/{REPO}/labels/{urllib.parse.quote(name)}")
-    if not existing.get("name"):
-        _gh("POST", f"/repos/{REPO}/labels", {"name": name, "color": color, "description": description})
-
-
-def set_labels(add_label: str):
-    """Remove old scan labels, add the new one."""
-    scan_labels = ["sql-scan-clean", "dba-review-required", "sql-hard-block"]
-
-    # Get current labels on the PR
-    current = _gh("GET", f"/repos/{REPO}/issues/{PR_NUMBER}/labels")
-    current_names = [l["name"] for l in current] if isinstance(current, list) else []
-
-    # Remove stale scan labels
-    for label in scan_labels:
-        if label in current_names:
-            try:
-                req = urllib.request.Request(
-                    f"{API}/repos/{REPO}/issues/{PR_NUMBER}/labels/{urllib.parse.quote(label)}",
-                    headers={
-                        "Authorization":        f"Bearer {GITHUB_TOKEN}",
-                        "Accept":               "application/vnd.github+json",
-                        "X-GitHub-Api-Version": "2022-11-28",
-                        "User-Agent":           "sql-review-bot/1.0",
-                    },
-                    method="DELETE",
-                )
-                with urllib.request.urlopen(req, timeout=30):
-                    pass
-            except Exception:
-                pass
-
-    # Add new label
-    _gh("POST", f"/repos/{REPO}/issues/{PR_NUMBER}/labels", {"labels": [add_label]})
-    print(f"Label set: {add_label}")
-
-
-def post_review(event: str, body: str):
-    """Post a PR review (REQUEST_CHANGES or APPROVE or COMMENT)."""
-    result = _gh("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", {
-        "event": event,
-        "body":  body,
-    })
-    if result.get("id"):
-        print(f"Review posted: id={result['id']} event={event}")
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Review body formatting
-# ---------------------------------------------------------------------------
-
-TIER_EMOJI = {"HARD_BLOCK": "🚫", "DBA_REVIEW": "⚠️", "CLEAN": "✅"}
-TIER_LABEL = {"HARD_BLOCK": "HARD BLOCK — must fix before merge", "DBA_REVIEW": "DBA Review Required", "CLEAN": "Clean"}
-
-
-def format_body(review: dict) -> str:
-    tier    = review.get("overall_tier", "CLEAN")
+def format_review_body(review: dict) -> str:
+    tier = review.get("overall_tier", "UNKNOWN")
     summary = review.get("summary", "")
-    items   = review.get("findings", [])
-    emoji   = TIER_EMOJI.get(tier, "❓")
-    label   = TIER_LABEL.get(tier, tier)
+    findings = review.get("findings", [])
 
+    emoji = {"HARD_BLOCK": "🚫", "DBA_REVIEW": "⚠️", "CLEAN": "✅"}.get(tier, "❓")
     lines = [
-        f"## {emoji} SQL Review — {label}",
+        f"## {emoji} SQL AI Review — {tier}",
         "",
-        summary,
+        f"> {summary}",
         "",
     ]
 
-    if tier == "HARD_BLOCK":
-        lines += [
-            "> **How to unblock:** Fix the issue(s) below and push again.",
-            "> The scanner will re-run automatically and approve when clean.",
-            "",
-        ]
-    elif tier == "DBA_REVIEW":
-        lines += [
-            "> **Next step:** A member of `@pdl-eda` has been requested as reviewer.",
-            "> The DBA must approve this PR before it can be merged.",
-            "",
-        ]
-
-    if items:
-        lines.append("---")
-        lines.append("")
-        lines.append("### Findings")
-        lines.append("")
-
-        for i, finding in enumerate(items, 1):
-            file_name = finding.get("file", "unknown")
-            line_no   = finding.get("line", 0)
-            pattern   = finding.get("pattern", "")
-            risk      = finding.get("risk", finding.get("description", ""))
-            fix       = finding.get("fix", "")
-
-            line_ref  = f"line {line_no}" if line_no > 0 else "whole-file check"
-            tier_of_finding = finding.get("tier", tier)
-            f_emoji   = "🚫" if tier_of_finding == "HARD_BLOCK" else "⚠️"
-
+    if findings:
+        for f in findings:
+            t_emoji = "🚫" if f.get("tier") == "HARD_BLOCK" else "⚠️"
             lines += [
-                f"#### {f_emoji} Finding {i}: `{pattern}`",
-                f"**File:** `{file_name}` ({line_ref})",
-                "",
-                f"**Risk:** {risk}",
-                "",
+                f"### {t_emoji} `{f.get('file', '?')}` — line {f.get('line', '?')}",
+                f"**{f.get('pattern', '?')}**  ",
+                f"{f.get('risk', '')}  ",
             ]
-
-            if fix and fix != "See rule documentation for the correct form.":
-                lines += [
-                    "**Corrected SQL:**",
-                    "```sql",
-                    fix.strip(),
-                    "```",
-                    "",
-                ]
-
-            lines.append("---")
+            fix = f.get("fix", "")
+            if fix:
+                lines += ["", "**Fix:**", "```sql", fix, "```"]
             lines.append("")
+    else:
+        lines.append("No findings — SQL changes look clean. All idempotency guards present.")
 
-    if tier == "CLEAN":
-        lines.append("All SQL patterns look good. No idempotency issues, no destructive operations without guards.")
-
+    lines += [
+        "---",
+        "*Reviewed by [SQL AI Review](/.github/workflows/sql-ai-review.yml) · "
+        "GitHub Models GPT-4o · Rules: [copilot-instructions.md](/.github/copilot-instructions.md)*",
+    ]
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Fallback: build review from findings.json if review.json is missing
-# ---------------------------------------------------------------------------
-
-def build_fallback_review() -> dict:
-    if not os.path.exists(FINDINGS_FILE):
-        return {"overall_tier": "CLEAN", "summary": "No findings.", "findings": []}
-    with open(FINDINGS_FILE) as f:
-        raw = json.load(f)
-    if not raw:
-        return {"overall_tier": "CLEAN", "summary": "No SQL issues detected.", "findings": []}
-    tier_order = {"HARD_BLOCK": 3, "DBA_REVIEW": 2, "CLEAN": 1}
-    overall = max((r["tier"] for r in raw), key=lambda t: tier_order.get(t, 0))
-    return {
-        "overall_tier": overall,
-        "summary": f"Scanner found {len(raw)} issue(s). LLM reasoning step did not produce output.",
-        "findings": [
-            {"file": r["file"], "line": r["line_number"], "pattern": r["pattern"],
-             "risk": r["description"], "fix": "See rule docs for the correct form.", "tier": r["tier"]}
-            for r in raw
-        ],
-    }
+def add_label(label: str) -> None:
+    gh_post(
+        f"/repos/{REPO}/issues/{PR_NUMBER}/labels",
+        {"labels": [label]},
+    )
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def post_review(event: str, body: str) -> None:
+    gh_post(
+        f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews",
+        {"event": event, "body": body},
+    )
 
-def main():
-    if not all([GITHUB_TOKEN, PR_NUMBER, REPO]):
-        print(f"Missing env vars. TOKEN={'set' if GITHUB_TOKEN else 'MISSING'}, PR={PR_NUMBER}, REPO={REPO}", file=sys.stderr)
+
+def main() -> None:
+    if not TOKEN or not REPO or not PR_NUMBER:
+        missing = [k for k, v in {"GITHUB_TOKEN": TOKEN, "REPO": REPO, "PR_NUMBER": PR_NUMBER}.items() if not v]
+        print(f"[enforce] Missing env vars: {missing}", file=sys.stderr)
         sys.exit(1)
 
-    # Load review.json (fall back if missing)
-    if os.path.exists(REVIEW_FILE):
-        with open(REVIEW_FILE) as f:
-            review = json.load(f)
-    else:
-        print(f"review.json not found at {REVIEW_FILE} — using fallback", file=sys.stderr)
-        review = build_fallback_review()
+    try:
+        review = json.loads(open(REVIEW_FILE, encoding="utf-8").read())
+    except FileNotFoundError:
+        print(f"[enforce] review file not found: {REVIEW_FILE}", file=sys.stderr)
+        # Safety: treat missing file as a hard block
+        review = {
+            "overall_tier": "HARD_BLOCK",
+            "summary": "Review file was not produced — AI reviewer may have crashed. Blocking as a precaution.",
+            "findings": [],
+        }
+    except json.JSONDecodeError as exc:
+        print(f"[enforce] Malformed review JSON: {exc}", file=sys.stderr)
+        review = {
+            "overall_tier": "HARD_BLOCK",
+            "summary": "AI reviewer produced malformed output. Blocking as a precaution.",
+            "findings": [],
+        }
 
-    tier = review.get("overall_tier", "CLEAN")
-    print(f"Enforcing tier: {tier}")
+    tier = review.get("overall_tier", "HARD_BLOCK")
+    body = format_review_body(review)
 
-    # Ensure labels exist
-    ensure_label("sql-scan-clean",      "0e8a16", "SQL scanner: no issues detected")
-    ensure_label("dba-review-required", "e4c100", "SQL scanner: DBA must review before merge")
-    ensure_label("sql-hard-block",      "d73a4a", "SQL scanner: blocking issue — fix before merge")
-
-    body = format_body(review)
-
-    if tier == "HARD_BLOCK":
-        post_review("REQUEST_CHANGES", body)
-        set_labels("sql-hard-block")
-        print("HARD_BLOCK — review posted, merge blocked")
-        sys.exit(1)  # fail the required CI check
+    if tier == "CLEAN":
+        post_review("APPROVE", body)
+        add_label("sql-scan-clean")
+        print("[enforce] CLEAN — approved")
+        sys.exit(0)
 
     elif tier == "DBA_REVIEW":
         post_review("REQUEST_CHANGES", body)
-        set_labels("dba-review-required")
-        print("DBA_REVIEW — review posted, DBA requested")
-        # Check passes (no exit 1) but REQUEST_CHANGES blocks merge via branch protection
+        add_label("dba-review-required")
+        print("[enforce] DBA_REVIEW — requested changes, DBA required")
+        sys.exit(0)  # CI check passes; DBA's approval gates the merge
 
-    else:
-        post_review("APPROVE", body)
-        set_labels("sql-scan-clean")
-        print("CLEAN — PR approved")
+    else:  # HARD_BLOCK or unknown
+        post_review("REQUEST_CHANGES", body)
+        add_label("sql-hard-block")
+        print("[enforce] HARD_BLOCK — requested changes, CI failing")
+        sys.exit(1)  # CI check fails → merge button disabled
 
 
 if __name__ == "__main__":
