@@ -59,18 +59,10 @@ jobs:
     name: Request Copilot as reviewer
     runs-on: ubuntu-latest
     steps:
-      - name: Get App token
-        uses: actions/create-github-app-token@v1
-        id: app-token
-        with:
-          app-id: ${{ secrets.READONLY_INTERNAL_APP_ID }}
-          private-key: ${{ secrets.READONLY_INTERNAL_APP_KEY }}
-          owner: ${{ github.repository_owner }}
-
-      - name: Add github-copilot[bot] to reviewers
+      - name: Add Copilot to reviewers
         uses: actions/github-script@v7
         with:
-          github-token: ${{ steps.app-token.outputs.token }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const pr = context.payload.pull_request.number;
             core.info(`Requesting Copilot review on PR #${pr}`);
@@ -110,14 +102,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get App token
-        uses: actions/create-github-app-token@v1
-        id: app-token
-        with:
-          app-id: ${{ secrets.READONLY_INTERNAL_APP_ID }}
-          private-key: ${{ secrets.READONLY_INTERNAL_APP_KEY }}
-          owner: ${{ github.repository_owner }}
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -134,8 +118,9 @@ jobs:
       - name: "Step 2 — Enforce (post review · label · gate)"
         if: always()
         env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SQL_SCAN_REVIEW_FILE: /tmp/review.json
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: python3 .github/scripts/enforce.py
