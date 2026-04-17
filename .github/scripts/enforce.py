@@ -182,7 +182,8 @@ def _write_step_summary(tier: str, summary: str, findings: list) -> None:
 # ---------------------------------------------------------------------------
 
 def post_review(tier: str, summary: str, findings: list) -> None:
-    event = "APPROVE" if tier == "CLEAN" else "REQUEST_CHANGES"
+    # GitHub Actions cannot APPROVE — use COMMENT for CLEAN, REQUEST_CHANGES for issues
+    event = "COMMENT" if tier == "CLEAN" else "REQUEST_CHANGES"
 
     # Findings with a real file + positive line → try as inline diff comments
     inline = [f for f in findings if f.get("file") and (f.get("line") or 0) > 0]
@@ -209,11 +210,15 @@ def post_review(tier: str, summary: str, findings: list) -> None:
     status, _ = _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", payload)
 
     if status == 422 and "comments" in payload:
-        # At least one line number is not in the diff range — fallback: move all to body
+        # Line numbers not in the diff range — remove inline comments, retry body-only
         print("[enforce] 422 — one or more lines not in diff; falling back to body-only review", file=sys.stderr)
         payload["body"] = _review_summary(tier, summary, findings)
         payload.pop("comments")
         _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", payload)
+        return
+    elif status == 422 and event == "COMMENT":
+        # Should not happen with COMMENT event, but guard anyway
+        print("[enforce] 422 on COMMENT review — check GitHub Actions permissions", file=sys.stderr)
         return
 
     n = len(payload.get("comments", []))
@@ -269,201 +274,6 @@ def main() -> None:
     else:
         add_label("sql-hard-block")
         print("[enforce] HARD_BLOCK — changes requested, CI failing ❌")
-        sys.exit(1)   # CI red → merge button disabled
-
-
-if __name__ == "__main__":
-    main()
-
-
-import json
-import os
-import sys
-import urllib.request
-import urllib.error
-
-REVIEW_FILE = os.environ.get("SQL_SCAN_REVIEW_FILE", "/tmp/review.json")
-GH_API      = "https://api.github.com"
-TOKEN       = os.environ.get("GITHUB_TOKEN", "")
-REPO        = os.environ.get("REPO", os.environ.get("GITHUB_REPOSITORY", ""))
-PR_NUMBER   = os.environ.get("PR_NUMBER", "")
-HEAD_SHA    = os.environ.get("HEAD_SHA", "")
-
-FOOTER = "\n\n---\n*[SQL AI Review](/.github/workflows) · GitHub Models GPT-4o · [Edit rules](/.github/instructions/sql.instructions.md)*"
-
-
-# ---------------------------------------------------------------------------
-# GitHub API helpers
-# ---------------------------------------------------------------------------
-
-def _request(method: str, path: str, payload: dict) -> tuple[int, dict]:
-    """Return (status_code, response_body). Never raises."""
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{GH_API}{path}",
-        data=data,
-        headers={
-            "Authorization": f"Bearer {TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        print(f"[enforce] GitHub API {exc.code} on {method} {path}: {body[:300]}", file=sys.stderr)
-        return exc.code, {}
-    except Exception as exc:  # noqa: BLE001
-        print(f"[enforce] Request failed: {exc}", file=sys.stderr)
-        return 0, {}
-
-
-def add_label(label: str) -> None:
-    _request("POST", f"/repos/{REPO}/issues/{PR_NUMBER}/labels", {"labels": [label]})
-
-
-# ---------------------------------------------------------------------------
-# Comment formatters
-# ---------------------------------------------------------------------------
-
-def _inline_body(f: dict) -> str:
-    """One inline diff comment for a single finding."""
-    icon  = "🚫" if f.get("tier") == "HARD_BLOCK" else "⚠️"
-    tag   = "[HARD_BLOCK]" if f.get("tier") == "HARD_BLOCK" else "[DBA_REVIEW]"
-    body  = f"{icon} **{tag} {f.get('pattern', 'SQL issue')}**\n\n{f.get('risk', '')}"
-    fix   = (f.get("fix") or "").strip()
-    if fix:
-        body += f"\n\n**Suggested fix:**\n```sql\n{fix}\n```"
-    body += FOOTER
-    return body
-
-
-def _review_summary(tier: str, summary: str, body_findings: list) -> str:
-    """Top-level review body — short summary + any findings that couldn't go inline."""
-    emoji = {"HARD_BLOCK": "🚫", "DBA_REVIEW": "⚠️", "CLEAN": "✅"}.get(tier, "❓")
-    lines = [f"## {emoji} SQL AI Review — {tier}", "", f"> {summary}"]
-
-    if tier == "CLEAN":
-        lines.append("\nSQL changes look good — all idempotency guards present, audit columns included.")
-
-    for f in body_findings:
-        icon = "🚫" if f.get("tier") == "HARD_BLOCK" else "⚠️"
-        lines += [
-            "",
-            f"### {icon} `{f.get('file', '?')}` — line {f.get('line', '?')}",
-            f"**{f.get('pattern', '?')}** — {f.get('risk', '')}",
-        ]
-        fix = (f.get("fix") or "").strip()
-        if fix:
-            lines += ["", f"```sql\n{fix}\n```"]
-
-    lines.append(FOOTER)
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Review posting with inline comments + 422 fallback
-# ---------------------------------------------------------------------------
-
-def post_review(tier: str, summary: str, findings: list) -> None:
-    event = "APPROVE" if tier == "CLEAN" else "REQUEST_CHANGES"
-
-    # Split findings: those with a real file + line go inline; the rest go in the body
-    inline_findings = [f for f in findings if f.get("file") and (f.get("line") or 0) > 0]
-    body_findings   = [f for f in findings if f not in inline_findings]
-
-    body = _review_summary(tier, summary, body_findings)
-
-    payload: dict = {
-        "event": event,
-        "body": body,
-    }
-
-    # Attach commit_id if we have it (required for inline review comments)
-    if HEAD_SHA:
-        payload["commit_id"] = HEAD_SHA
-
-    # Build inline comments
-    if inline_findings:
-        payload["comments"] = [
-            {
-                "path": f["file"],
-                "line": f["line"],
-                "side": "RIGHT",
-                "body": _inline_body(f),
-            }
-            for f in inline_findings
-        ]
-
-    # First attempt — with inline comments
-    status, _ = _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", payload)
-
-    if status == 422 and "comments" in payload:
-        # GitHub rejected at least one line number (not in diff range).
-        # Fallback: move inline findings into the body and retry without comments.
-        print("[enforce] 422 on inline review; retrying body-only", file=sys.stderr)
-        all_findings = inline_findings + body_findings
-        payload["body"] = _review_summary(tier, summary, all_findings)
-        payload.pop("comments")
-        _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", payload)
-        return
-
-    n = len(payload.get("comments", []))
-    print(f"[enforce] Posted {event} review with {n} inline comment(s)")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    if not TOKEN or not REPO or not PR_NUMBER:
-        missing = [k for k, v in {"GITHUB_TOKEN": TOKEN, "REPO": REPO, "PR_NUMBER": PR_NUMBER}.items() if not v]
-        print(f"[enforce] Missing env vars: {missing}", file=sys.stderr)
-        sys.exit(1)
-
-    if not HEAD_SHA:
-        print("[enforce] WARNING: HEAD_SHA not set — inline comments may be rejected by GitHub", file=sys.stderr)
-
-    # Load review.json
-    try:
-        review = json.loads(open(REVIEW_FILE, encoding="utf-8").read())  # noqa: WPS515
-    except FileNotFoundError:
-        print(f"[enforce] review file not found: {REVIEW_FILE} — blocking as precaution", file=sys.stderr)
-        review = {
-            "overall_tier": "HARD_BLOCK",
-            "summary": "AI reviewer did not produce a review file. Blocking as a precaution — check Step 1 logs.",
-            "findings": [],
-        }
-    except json.JSONDecodeError as exc:
-        print(f"[enforce] Malformed review JSON: {exc} — blocking as precaution", file=sys.stderr)
-        review = {
-            "overall_tier": "HARD_BLOCK",
-            "summary": "AI reviewer produced malformed output. Blocking as a precaution.",
-            "findings": [],
-        }
-
-    tier     = review.get("overall_tier", "HARD_BLOCK")
-    summary  = review.get("summary", "")
-    findings = review.get("findings", [])
-
-    post_review(tier, summary, findings)
-
-    if tier == "CLEAN":
-        add_label("sql-scan-clean")
-        print("[enforce] CLEAN — approved")
-        sys.exit(0)
-    elif tier == "DBA_REVIEW":
-        add_label("dba-review-required")
-        print("[enforce] DBA_REVIEW — changes requested, DBA required before merge")
-        sys.exit(0)   # CI green; DBA approval gates the merge via branch protection
-    else:
-        add_label("sql-hard-block")
-        print("[enforce] HARD_BLOCK — changes requested, CI failing")
         sys.exit(1)   # CI red → merge button disabled
 
 
