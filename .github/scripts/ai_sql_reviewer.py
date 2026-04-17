@@ -1,35 +1,39 @@
 #!/usr/bin/env python3
 """
 AI SQL Reviewer — Coreservices Database Deployments
-Replaces sql_pr_scan.py with a pure AI review pass using GitHub Models (GPT-4o).
+====================================================
+End-to-end AI review: no hardcoded rules, no regex. All SQL analysis is delegated to GPT-4o.
 
-Python's role here is ONLY:
-  1. Retrieve the git diff for changed SQL files
-  2. Classify each file by path/name (not by SQL parsing)
-  3. Call the GitHub Models API with the full diff + rule system prompt
-  4. Write the structured review.json for enforce.py to consume
+Architecture (borrowed from Gemini CI/CD Bot pattern + Reviewbot):
+  GitHub Actions (CI)
+    → checkout + get diff
+    → classify files by path (Python — path strings only, no SQL parsing)
+    → send full diff + sql_review_prompt.md (all rules in plain English) to GPT-4o
+    → parse structured JSON response  { overall_tier, summary, findings[] }
+    → write /tmp/review.json  →  enforce.py posts inline comments + label + gate
 
-ALL SQL analysis is done by GPT-4o. Zero hardcoded regex rules.
+To add/remove/change a rule:
+  Edit .github/instructions/sql.instructions.md  (one table row = one rule)
+  No Python, no regex, no code changes required.
 
-Outputs:
-  $SQL_REVIEW_OUTPUT (default: /tmp/review.json)
-  GitHub Actions step summary
-  Exit code always 0 — enforce.py owns the exit code
+Python's role:
+  1. git diff (changed SQL files)
+  2. classify each file by filename/path only
+  3. call GitHub Models API with retry
+  4. write review.json + GitHub Actions step summary
 
-Environment variables:
-  GITHUB_TOKEN  — automatically set in GitHub Actions (models: read permission required)
-  BASE_SHA      — base commit SHA (github.event.pull_request.base.sha)
-  HEAD_SHA      — head commit SHA (github.event.pull_request.head.sha)
-  SQL_REVIEW_OUTPUT — path to write review.json (default: /tmp/review.json)
-
-Usage:
-  python3 .github/scripts/ai_sql_reviewer.py
+Environment:
+  GITHUB_TOKEN      — set automatically by Actions (models: read permission required)
+  BASE_SHA          — github.event.pull_request.base.sha
+  HEAD_SHA          — github.event.pull_request.head.sha
+  SQL_REVIEW_OUTPUT — output path (default: /tmp/review.json)
 """
 
 import json
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -39,12 +43,14 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 GITHUB_MODELS_ENDPOINT = "https://models.github.ai/inference/chat/completions"
-MODEL = "openai/gpt-4o"
-GITHUB_API_VERSION = "2026-03-10"
-MAX_DIFF_CHARS = 30_000  # cap to stay within context window
-TEMPERATURE = 0.1        # near-deterministic for compliance review
+MODEL               = "openai/gpt-4o"
+GITHUB_API_VERSION  = "2026-03-10"
+MAX_DIFF_CHARS      = 30_000   # cap to stay within context window
+TEMPERATURE         = 0.1      # near-deterministic for compliance review
+MAX_RETRIES         = 3        # retry on 429/503
+RETRY_WAIT_S        = 65       # GitHub Models free tier: 10 req/min → wait 65s on 429
 
-SCRIPT_DIR = Path(__file__).parent
+SCRIPT_DIR  = Path(__file__).parent
 PROMPT_FILE = SCRIPT_DIR / "sql_review_prompt.md"
 OUTPUT_FILE = Path(os.environ.get("SQL_REVIEW_OUTPUT", "/tmp/review.json"))
 
@@ -156,30 +162,41 @@ def call_ai_reviewer(files_info: list[dict], diff: str) -> dict:
         "response_format": {"type": "json_object"},
     }).encode("utf-8")
 
-    req = urllib.request.Request(
-        GITHUB_MODELS_ENDPOINT,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        },
-        method="POST",
-    )
+    # Retry loop — handles 429 (rate limit) and 503 (transient error)
+    for attempt in range(1, MAX_RETRIES + 1):
+        req = urllib.request.Request(
+            GITHUB_MODELS_ENDPOINT,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": GITHUB_API_VERSION,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                content = body["choices"][0]["message"]["content"]
+                return json.loads(content)
+        except urllib.error.HTTPError as exc:
+            err = exc.read().decode("utf-8", errors="replace")
+            if exc.code in (429, 503) and attempt < MAX_RETRIES:
+                print(
+                    f"[ai_sql_reviewer] HTTP {exc.code} on attempt {attempt}/{MAX_RETRIES} "
+                    f"— waiting {RETRY_WAIT_S}s before retry...",
+                    file=sys.stderr,
+                )
+                time.sleep(RETRY_WAIT_S)
+                continue
+            print(f"[ai_sql_reviewer] API HTTP error {exc.code}: {err[:300]}", file=sys.stderr)
+            return _safety_block(files_info, f"GitHub Models API returned HTTP {exc.code}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ai_sql_reviewer] API call failed: {exc}", file=sys.stderr)
+            return _safety_block(files_info, f"AI reviewer unavailable: {exc}")
 
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-            content = body["choices"][0]["message"]["content"]
-            return json.loads(content)
-    except urllib.error.HTTPError as exc:
-        err = exc.read().decode("utf-8", errors="replace")
-        print(f"[ai_sql_reviewer] API HTTP error {exc.code}: {err}", file=sys.stderr)
-        return _safety_block(files_info, f"GitHub Models API returned HTTP {exc.code}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[ai_sql_reviewer] API call failed: {exc}", file=sys.stderr)
-        return _safety_block(files_info, f"AI reviewer unavailable: {exc}")
+    return _safety_block(files_info, f"All {MAX_RETRIES} retry attempts failed")
 
 
 def _safety_block(files_info: list[dict], reason: str) -> dict:
@@ -208,36 +225,50 @@ def _safety_block(files_info: list[dict], reason: str) -> dict:
 # GitHub Actions step summary
 # ---------------------------------------------------------------------------
 
+_SEVERITY_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}
+_TIER_ICON     = {"HARD_BLOCK": "🚫", "DBA_REVIEW": "⚠️", "CLEAN": "✅"}
+
+
 def build_step_summary(review: dict, files_info: list[dict]) -> str:
-    tier = review.get("overall_tier", "UNKNOWN")
-    summary = review.get("summary", "")
+    tier     = review.get("overall_tier", "UNKNOWN")
+    summary  = review.get("summary", "")
     findings = review.get("findings", [])
 
-    tier_emoji = {"HARD_BLOCK": "🚫", "DBA_REVIEW": "⚠️", "CLEAN": "✅"}.get(tier, "❓")
+    tier_icon = _TIER_ICON.get(tier, "❓")
     lines = [
-        f"## {tier_emoji} SQL AI Review — {tier}",
+        f"## {tier_icon} SQL AI Review — {tier}",
         "",
-        f"**Model:** {MODEL}  |  **Files reviewed:** {len(files_info)}",
+        f"| Model | Files reviewed | Findings |",
+        f"|---|---|---|",
+        f"| `{MODEL}` | {len(files_info)} | {len(findings)} |",
         "",
         f"> {summary}" if summary else "",
         "",
     ]
 
     if findings:
-        lines += ["### Findings", ""]
+        lines += [
+            "### Findings",
+            "",
+            "| Severity | Tier | File | Line | Pattern | Confidence |",
+            "|---|---|---|---|---|---|",
+        ]
         for f in findings:
-            t_emoji = "🚫" if f.get("tier") == "HARD_BLOCK" else "⚠️"
-            lines.append(f"#### {t_emoji} `{f.get('file', '?')}` — line {f.get('line', '?')}")
-            lines.append(f"**Pattern:** {f.get('pattern', '?')}  ")
-            lines.append(f"**Risk:** {f.get('risk', '')}  ")
-            fix = f.get("fix", "")
-            if fix:
-                lines += ["**Fix:**", "```sql", fix, "```"]
-            lines.append("")
+            sev  = f.get("severity", "HIGH")
+            icon = _SEVERITY_ICON.get(sev, "🟠")
+            conf = f.get("confidence", 0)
+            conf_pct = f"{int(conf * 100)}%" if conf else "—"
+            tier_tag = f.get("tier", "DBA_REVIEW")
+            lines.append(
+                f"| {icon} {sev} | {tier_tag} | `{f.get('file', '?')}` "
+                f"| {f.get('line', '?')} | {f.get('pattern', '?')} | {conf_pct} |"
+            )
+        lines.append("")
     else:
-        lines.append("No findings — SQL changes look clean.")
+        lines.append("No findings — SQL changes look clean. ✅")
 
     return "\n".join(lines)
+
 
 
 # ---------------------------------------------------------------------------

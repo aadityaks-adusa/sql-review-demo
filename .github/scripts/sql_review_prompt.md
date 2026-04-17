@@ -242,16 +242,96 @@ Respond with exactly this JSON structure — no markdown, no preamble, no code f
       "line": 42,
       "pattern": "rule name — e.g. H1: ADD COLUMN without IF NOT EXISTS",
       "tier": "HARD_BLOCK | DBA_REVIEW",
+      "severity": "CRITICAL | HIGH | MEDIUM | LOW",
+      "confidence": 0.95,
       "risk": "plain-English explanation of the specific risk at this line (2-3 sentences)",
       "fix": "complete corrected SQL statement ready to copy-paste"
     }
   ]
 }
 
-Rules:
+Schema rules:
 - overall_tier is the highest tier across all findings (HARD_BLOCK > DBA_REVIEW > CLEAN)
 - findings is an empty array [] for a CLEAN review
-- line is your best estimate of the 1-based line number in the diff where the issue occurs
-- fix must be a complete, valid SQL statement — not a description of what to do
-- If a single file has multiple issues, emit one finding object per issue
-- Do not include findings for things in the "Do NOT flag" list above
+- line is the 1-based line number in the **new version of the file** (right side of the diff)
+  where the bad statement appears. This is used to anchor an inline GitHub PR review comment
+  to the exact diff line. Be as precise as possible — count from line 1 of the file.
+- severity guide:
+    CRITICAL — irreversible data loss (DELETE/UPDATE without WHERE, TRUNCATE outside function body)
+    HIGH     — crash on Flyway retry or deploy failure (ADD COLUMN/TABLE without IF NOT EXISTS, DDL in DML)
+    MEDIUM   — locking/blocking risk or destructive (ALTER COLUMN TYPE, DROP TABLE/COLUMN, ALTER SEQUENCE)
+    LOW      — policy/advisory (missing audit columns, PII column names, DBA review advisory)
+- confidence is a float 0.0–1.0 representing how certain you are this is a real issue
+    (not a false positive). Use 0.95+ for unambiguous structural issues, 0.70–0.89 for context-dependent ones.
+- fix must be a complete, valid SQL statement — not a description. It must be copy-paste ready.
+- If a single file has multiple issues, emit one finding object per issue.
+- Do not include findings for things in the "Do NOT flag" list above.
+
+---
+
+## Few-shot examples
+
+### Example 1 — HARD_BLOCK (H1 + H3 in the same migration)
+
+Input diff (V2026_04_16__add_promo_columns.sql, DDL_versioned):
+```diff
++ALTER TABLE cart.cart_item
++    ADD COLUMN promo_cd VARCHAR(50),
++    ADD COLUMN promo_discount_pct NUMERIC(5,2);
++
++DELETE FROM cart.cart_item_import_staging;
+```
+
+Expected JSON output:
+```json
+{
+  "overall_tier": "HARD_BLOCK",
+  "summary": "Two blocking issues: ADD COLUMN without IF NOT EXISTS will crash on Flyway retry; DELETE without WHERE will wipe the entire staging table.",
+  "findings": [
+    {
+      "file": "cart/source/sql/V2026_04_16__add_promo_columns.sql",
+      "line": 2,
+      "pattern": "H1: ADD COLUMN without IF NOT EXISTS",
+      "tier": "HARD_BLOCK",
+      "severity": "HIGH",
+      "confidence": 0.99,
+      "risk": "If this Flyway migration is retried after a partial failure, it will crash with 'column already exists'. This caused a 45-minute outage in OCDOMAIN-15294.",
+      "fix": "ALTER TABLE cart.cart_item ADD COLUMN IF NOT EXISTS promo_cd VARCHAR(50), ADD COLUMN IF NOT EXISTS promo_discount_pct NUMERIC(5,2);"
+    },
+    {
+      "file": "cart/source/sql/V2026_04_16__add_promo_columns.sql",
+      "line": 5,
+      "pattern": "H3: DELETE FROM without WHERE",
+      "tier": "HARD_BLOCK",
+      "severity": "CRITICAL",
+      "confidence": 0.99,
+      "risk": "DELETE without a WHERE clause removes every row in cart_item_import_staging. This cannot be rolled back in a Flyway transaction that has already committed earlier steps.",
+      "fix": "DELETE FROM cart.cart_item_import_staging WHERE import_run_id = '<specific-run-id>';"
+    }
+  ]
+}
+```
+
+### Example 2 — CLEAN (dollar-quote ETL body, must NOT flag)
+
+Input diff (R__fn_refresh_order_summary.sql, DDL_repeatable):
+```diff
++CREATE OR REPLACE FUNCTION orders.fn_refresh_order_summary()
++RETURNS void LANGUAGE plpgsql AS $function$
++BEGIN
++    TRUNCATE TABLE orders.order_summary_staging;
++    INSERT INTO orders.order_summary_staging
++        SELECT order_id, SUM(line_total) FROM orders.order_line GROUP BY order_id;
++END;
++$function$;
+```
+
+Expected JSON output:
+```json
+{
+  "overall_tier": "CLEAN",
+  "summary": "TRUNCATE inside the dollar-quote function body is a legitimate ETL pattern in R__*.sql. No issues found.",
+  "findings": []
+}
+```
+

@@ -1,17 +1,31 @@
 #!/usr/bin/env python3
 """
-Enforce — reads review.json from ai_sql_reviewer.py and posts a formal GitHub PR review.
+Enforce — reads review.json → posts inline GitHub PR review → labels → exit code.
+===================================================================================
+Implements the "Copilot explains, CI enforces" pattern from the community.
 
-Actions taken:
-  HARD_BLOCK  → POST REQUEST_CHANGES review, add sql-hard-block label, exit 1 (CI fails)
-  DBA_REVIEW  → POST REQUEST_CHANGES review, add dba-review-required label, exit 0
-  CLEAN       → POST APPROVE review, add sql-scan-clean label, exit 0
+Architecture (Gemini CI/CD Bot pattern adapted for GitHub Models):
+  ai_sql_reviewer.py writes /tmp/review.json
+  enforce.py reads it and:
+    1. Builds one batched createReview call with ALL findings as inline diff comments
+       (one comment per finding, anchored to exact diff line — like a senior engineer)
+    2. Falls back to body-only if GitHub rejects any line numbers (422)
+    3. Adds a label (sql-hard-block | dba-review-required | sql-scan-clean)
+    4. Writes a step summary table for observability
+    5. Exits 1 on HARD_BLOCK (CI gate) or 0 otherwise
 
-Environment variables:
-  GITHUB_TOKEN          — token with pull-requests: write and issues: write
+Severity display (borrowed from Reviewbot / Gemini CI pattern):
+  🔴 CRITICAL   — irreversible data loss (DELETE/UPDATE without WHERE)
+  🟠 HIGH       — crash on retry (ADD COLUMN without IF NOT EXISTS)
+  🟡 MEDIUM     — locking / destructive (ALTER TYPE, DROP, ALTER SEQUENCE)
+  🔵 LOW        — policy / advisory (audit columns, PII)
+
+Environment:
+  GITHUB_TOKEN          — pull-requests: write + issues: write
   SQL_SCAN_REVIEW_FILE  — path to review.json (default: /tmp/review.json)
   PR_NUMBER             — pull request number
-  REPO                  — owner/repo string (e.g. ADUSA-Digital/pdl-coreservices-database-deployments)
+  REPO                  — owner/repo
+  HEAD_SHA              — PR head commit SHA (required for inline anchoring)
 """
 
 import json
@@ -21,13 +35,28 @@ import urllib.request
 import urllib.error
 
 REVIEW_FILE = os.environ.get("SQL_SCAN_REVIEW_FILE", "/tmp/review.json")
-GH_API = "https://api.github.com"
-TOKEN = os.environ.get("GITHUB_TOKEN", "")
-REPO = os.environ.get("REPO", os.environ.get("GITHUB_REPOSITORY", ""))
-PR_NUMBER = os.environ.get("PR_NUMBER", "")
+GH_API      = "https://api.github.com"
+TOKEN       = os.environ.get("GITHUB_TOKEN", "")
+REPO        = os.environ.get("REPO", os.environ.get("GITHUB_REPOSITORY", ""))
+PR_NUMBER   = os.environ.get("PR_NUMBER", "")
+HEAD_SHA    = os.environ.get("HEAD_SHA", "")
+
+# Severity → icon (borrowing from Gemini CI/CD Bot pattern)
+_SEV_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}
+_TIER_ICON = {"HARD_BLOCK": "🚫", "DBA_REVIEW": "⚠️", "CLEAN": "✅"}
+
+FOOTER = (
+    "\n\n---\n"
+    "*[SQL AI Review](/.github/workflows) · GitHub Models GPT-4o · "
+    "[Edit rules ↗](/.github/instructions/sql.instructions.md)*"
+)
 
 
-def gh_post(path: str, payload: dict) -> dict:
+# ---------------------------------------------------------------------------
+# GitHub API helper
+# ---------------------------------------------------------------------------
+
+def _request(method: str, path: str, payload: dict) -> tuple[int, dict]:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{GH_API}{path}",
@@ -38,66 +67,162 @@ def gh_post(path: str, payload: dict) -> dict:
             "Content-Type": "application/json",
             "X-GitHub-Api-Version": "2022-11-28",
         },
-        method="POST",
+        method=method,
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        print(f"[enforce] GitHub API {exc.code} on {path}: {body}", file=sys.stderr)
-        return {}
+        print(f"[enforce] GitHub API {exc.code} on {method} {path}: {body[:400]}", file=sys.stderr)
+        return exc.code, {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[enforce] Request failed: {exc}", file=sys.stderr)
+        return 0, {}
 
 
-def format_review_body(review: dict) -> str:
-    tier = review.get("overall_tier", "UNKNOWN")
-    summary = review.get("summary", "")
-    findings = review.get("findings", [])
+def add_label(label: str) -> None:
+    _request("POST", f"/repos/{REPO}/issues/{PR_NUMBER}/labels", {"labels": [label]})
 
-    emoji = {"HARD_BLOCK": "🚫", "DBA_REVIEW": "⚠️", "CLEAN": "✅"}.get(tier, "❓")
+
+# ---------------------------------------------------------------------------
+# Inline comment body builder (one comment = one finding)
+# Borrowing from Gemini CI/CD pattern: precise, actionable, copy-pasteable
+# ---------------------------------------------------------------------------
+
+def _inline_comment_body(finding: dict) -> str:
+    sev   = finding.get("severity", "HIGH")
+    tier  = finding.get("tier", "DBA_REVIEW")
+    icon  = _SEV_ICON.get(sev, "🟠")
+    tag   = "[HARD_BLOCK]" if tier == "HARD_BLOCK" else "[DBA_REVIEW]"
+    conf  = finding.get("confidence", 0)
+    conf_str = f" · confidence {int(conf * 100)}%" if conf else ""
+
+    body  = f"{icon} **{tag} {finding.get('pattern', 'SQL issue')}**{conf_str}\n\n"
+    body += finding.get("risk", "")
+
+    fix = (finding.get("fix") or "").strip()
+    if fix:
+        body += f"\n\n**Suggested fix** (copy-paste ready):\n```sql\n{fix}\n```"
+
+    body += FOOTER
+    return body
+
+
+# ---------------------------------------------------------------------------
+# Review summary (top-level body — shown in Review tab)
+# ---------------------------------------------------------------------------
+
+def _review_summary(tier: str, summary: str, overflow_findings: list) -> str:
+    icon  = _TIER_ICON.get(tier, "❓")
+    lines = [f"## {icon} SQL AI Review — {tier}", "", f"> {summary}"]
+
+    if tier == "CLEAN":
+        lines.append(
+            "\nSQL changes look good — all idempotency guards present, "
+            "audit columns included. ✅"
+        )
+
+    # findings that couldn't go inline (line=0 or not in diff) go here
+    for f in overflow_findings:
+        sev  = f.get("severity", "HIGH")
+        sev_icon = _SEV_ICON.get(sev, "🟠")
+        lines += [
+            "",
+            f"### {sev_icon} `{f.get('file', '?')}` — line {f.get('line', '?')}",
+            f"**{f.get('pattern', '?')}** — {f.get('risk', '')}",
+        ]
+        fix = (f.get("fix") or "").strip()
+        if fix:
+            lines += ["", f"```sql\n{fix}\n```"]
+
+    lines.append(FOOTER)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# GitHub Actions step summary table
+# ---------------------------------------------------------------------------
+
+def _write_step_summary(tier: str, summary: str, findings: list) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+    if not path:
+        return
+    icon = _TIER_ICON.get(tier, "❓")
     lines = [
-        f"## {emoji} SQL AI Review — {tier}",
+        f"## {icon} SQL AI Review — {tier}",
         "",
         f"> {summary}",
         "",
     ]
-
     if findings:
+        lines += [
+            "| Severity | Tier | File | Line | Pattern | Confidence |",
+            "|---|---|---|---|---|---|",
+        ]
         for f in findings:
-            t_emoji = "🚫" if f.get("tier") == "HARD_BLOCK" else "⚠️"
-            lines += [
-                f"### {t_emoji} `{f.get('file', '?')}` — line {f.get('line', '?')}",
-                f"**{f.get('pattern', '?')}**  ",
-                f"{f.get('risk', '')}  ",
-            ]
-            fix = f.get("fix", "")
-            if fix:
-                lines += ["", "**Fix:**", "```sql", fix, "```"]
-            lines.append("")
+            sev      = f.get("severity", "HIGH")
+            sev_icon = _SEV_ICON.get(sev, "🟠")
+            conf     = f.get("confidence", 0)
+            conf_pct = f"{int(conf * 100)}%" if conf else "—"
+            lines.append(
+                f"| {sev_icon} {sev} | {f.get('tier','?')} | `{f.get('file','?')}` "
+                f"| {f.get('line','?')} | {f.get('pattern','?')} | {conf_pct} |"
+            )
     else:
-        lines.append("No findings — SQL changes look clean. All idempotency guards present.")
-
-    lines += [
-        "---",
-        "*Reviewed by [SQL AI Review](/.github/workflows/sql-ai-review.yml) · "
-        "GitHub Models GPT-4o · Rules: [copilot-instructions.md](/.github/copilot-instructions.md)*",
-    ]
-    return "\n".join(lines)
+        lines.append("No findings. ✅")
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
-def add_label(label: str) -> None:
-    gh_post(
-        f"/repos/{REPO}/issues/{PR_NUMBER}/labels",
-        {"labels": [label]},
-    )
+# ---------------------------------------------------------------------------
+# Core: post a single batched createReview with all inline comments
+# Borrowed from Medium article pattern: one API call, all comments at once
+# Falls back to body-only if GitHub rejects any line (422 = line not in diff)
+# ---------------------------------------------------------------------------
+
+def post_review(tier: str, summary: str, findings: list) -> None:
+    event = "APPROVE" if tier == "CLEAN" else "REQUEST_CHANGES"
+
+    # Findings with a real file + positive line → try as inline diff comments
+    inline = [f for f in findings if f.get("file") and (f.get("line") or 0) > 0]
+    overflow = [f for f in findings if f not in inline]  # no file or line=0
+
+    body = _review_summary(tier, summary, overflow)
+
+    payload: dict = {"event": event, "body": body}
+    if HEAD_SHA:
+        payload["commit_id"] = HEAD_SHA
+
+    # Attach per-finding inline comments (one comment per finding, exact line)
+    if inline:
+        payload["comments"] = [
+            {
+                "path": f["file"],
+                "line": f["line"],
+                "side": "RIGHT",
+                "body": _inline_comment_body(f),
+            }
+            for f in inline
+        ]
+
+    status, _ = _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", payload)
+
+    if status == 422 and "comments" in payload:
+        # At least one line number is not in the diff range — fallback: move all to body
+        print("[enforce] 422 — one or more lines not in diff; falling back to body-only review", file=sys.stderr)
+        payload["body"] = _review_summary(tier, summary, findings)
+        payload.pop("comments")
+        _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", payload)
+        return
+
+    n = len(payload.get("comments", []))
+    print(f"[enforce] Posted {event} review — {n} inline comment(s), {len(overflow)} in body")
 
 
-def post_review(event: str, body: str) -> None:
-    gh_post(
-        f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews",
-        {"event": event, "body": body},
-    )
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     if not TOKEN or not REPO or not PR_NUMBER:
@@ -105,45 +230,243 @@ def main() -> None:
         print(f"[enforce] Missing env vars: {missing}", file=sys.stderr)
         sys.exit(1)
 
+    if not HEAD_SHA:
+        print("[enforce] WARNING: HEAD_SHA not set — inline diff anchoring will be degraded", file=sys.stderr)
+
+    # Load review.json — fail closed on any error (don't silently pass bad reviews)
     try:
-        review = json.loads(open(REVIEW_FILE, encoding="utf-8").read())
+        review = json.loads(open(REVIEW_FILE, encoding="utf-8").read())  # noqa: WPS515
     except FileNotFoundError:
-        print(f"[enforce] review file not found: {REVIEW_FILE}", file=sys.stderr)
-        # Safety: treat missing file as a hard block
+        print(f"[enforce] {REVIEW_FILE} not found — blocking as precaution", file=sys.stderr)
         review = {
             "overall_tier": "HARD_BLOCK",
-            "summary": "Review file was not produced — AI reviewer may have crashed. Blocking as a precaution.",
+            "summary": "AI reviewer did not produce a review file. Check Step 1 logs. Blocking as a precaution.",
             "findings": [],
         }
     except json.JSONDecodeError as exc:
-        print(f"[enforce] Malformed review JSON: {exc}", file=sys.stderr)
+        print(f"[enforce] Malformed JSON: {exc}", file=sys.stderr)
         review = {
             "overall_tier": "HARD_BLOCK",
             "summary": "AI reviewer produced malformed output. Blocking as a precaution.",
             "findings": [],
         }
 
-    tier = review.get("overall_tier", "HARD_BLOCK")
-    body = format_review_body(review)
+    tier     = review.get("overall_tier", "HARD_BLOCK")
+    summary  = review.get("summary", "")
+    findings = review.get("findings", [])
+
+    post_review(tier, summary, findings)
+    _write_step_summary(tier, summary, findings)
 
     if tier == "CLEAN":
-        post_review("APPROVE", body)
         add_label("sql-scan-clean")
-        print("[enforce] CLEAN — approved")
+        print("[enforce] CLEAN — approved ✅")
         sys.exit(0)
-
     elif tier == "DBA_REVIEW":
-        post_review("REQUEST_CHANGES", body)
         add_label("dba-review-required")
-        print("[enforce] DBA_REVIEW — requested changes, DBA required")
-        sys.exit(0)  # CI check passes; DBA's approval gates the merge
-
-    else:  # HARD_BLOCK or unknown
-        post_review("REQUEST_CHANGES", body)
+        print("[enforce] DBA_REVIEW — changes requested, DBA approval required before merge")
+        sys.exit(0)   # CI green; DBA approval is the merge gate
+    else:
         add_label("sql-hard-block")
-        print("[enforce] HARD_BLOCK — requested changes, CI failing")
-        sys.exit(1)  # CI check fails → merge button disabled
+        print("[enforce] HARD_BLOCK — changes requested, CI failing ❌")
+        sys.exit(1)   # CI red → merge button disabled
 
 
 if __name__ == "__main__":
     main()
+
+
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+REVIEW_FILE = os.environ.get("SQL_SCAN_REVIEW_FILE", "/tmp/review.json")
+GH_API      = "https://api.github.com"
+TOKEN       = os.environ.get("GITHUB_TOKEN", "")
+REPO        = os.environ.get("REPO", os.environ.get("GITHUB_REPOSITORY", ""))
+PR_NUMBER   = os.environ.get("PR_NUMBER", "")
+HEAD_SHA    = os.environ.get("HEAD_SHA", "")
+
+FOOTER = "\n\n---\n*[SQL AI Review](/.github/workflows) · GitHub Models GPT-4o · [Edit rules](/.github/instructions/sql.instructions.md)*"
+
+
+# ---------------------------------------------------------------------------
+# GitHub API helpers
+# ---------------------------------------------------------------------------
+
+def _request(method: str, path: str, payload: dict) -> tuple[int, dict]:
+    """Return (status_code, response_body). Never raises."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{GH_API}{path}",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        print(f"[enforce] GitHub API {exc.code} on {method} {path}: {body[:300]}", file=sys.stderr)
+        return exc.code, {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[enforce] Request failed: {exc}", file=sys.stderr)
+        return 0, {}
+
+
+def add_label(label: str) -> None:
+    _request("POST", f"/repos/{REPO}/issues/{PR_NUMBER}/labels", {"labels": [label]})
+
+
+# ---------------------------------------------------------------------------
+# Comment formatters
+# ---------------------------------------------------------------------------
+
+def _inline_body(f: dict) -> str:
+    """One inline diff comment for a single finding."""
+    icon  = "🚫" if f.get("tier") == "HARD_BLOCK" else "⚠️"
+    tag   = "[HARD_BLOCK]" if f.get("tier") == "HARD_BLOCK" else "[DBA_REVIEW]"
+    body  = f"{icon} **{tag} {f.get('pattern', 'SQL issue')}**\n\n{f.get('risk', '')}"
+    fix   = (f.get("fix") or "").strip()
+    if fix:
+        body += f"\n\n**Suggested fix:**\n```sql\n{fix}\n```"
+    body += FOOTER
+    return body
+
+
+def _review_summary(tier: str, summary: str, body_findings: list) -> str:
+    """Top-level review body — short summary + any findings that couldn't go inline."""
+    emoji = {"HARD_BLOCK": "🚫", "DBA_REVIEW": "⚠️", "CLEAN": "✅"}.get(tier, "❓")
+    lines = [f"## {emoji} SQL AI Review — {tier}", "", f"> {summary}"]
+
+    if tier == "CLEAN":
+        lines.append("\nSQL changes look good — all idempotency guards present, audit columns included.")
+
+    for f in body_findings:
+        icon = "🚫" if f.get("tier") == "HARD_BLOCK" else "⚠️"
+        lines += [
+            "",
+            f"### {icon} `{f.get('file', '?')}` — line {f.get('line', '?')}",
+            f"**{f.get('pattern', '?')}** — {f.get('risk', '')}",
+        ]
+        fix = (f.get("fix") or "").strip()
+        if fix:
+            lines += ["", f"```sql\n{fix}\n```"]
+
+    lines.append(FOOTER)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Review posting with inline comments + 422 fallback
+# ---------------------------------------------------------------------------
+
+def post_review(tier: str, summary: str, findings: list) -> None:
+    event = "APPROVE" if tier == "CLEAN" else "REQUEST_CHANGES"
+
+    # Split findings: those with a real file + line go inline; the rest go in the body
+    inline_findings = [f for f in findings if f.get("file") and (f.get("line") or 0) > 0]
+    body_findings   = [f for f in findings if f not in inline_findings]
+
+    body = _review_summary(tier, summary, body_findings)
+
+    payload: dict = {
+        "event": event,
+        "body": body,
+    }
+
+    # Attach commit_id if we have it (required for inline review comments)
+    if HEAD_SHA:
+        payload["commit_id"] = HEAD_SHA
+
+    # Build inline comments
+    if inline_findings:
+        payload["comments"] = [
+            {
+                "path": f["file"],
+                "line": f["line"],
+                "side": "RIGHT",
+                "body": _inline_body(f),
+            }
+            for f in inline_findings
+        ]
+
+    # First attempt — with inline comments
+    status, _ = _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", payload)
+
+    if status == 422 and "comments" in payload:
+        # GitHub rejected at least one line number (not in diff range).
+        # Fallback: move inline findings into the body and retry without comments.
+        print("[enforce] 422 on inline review; retrying body-only", file=sys.stderr)
+        all_findings = inline_findings + body_findings
+        payload["body"] = _review_summary(tier, summary, all_findings)
+        payload.pop("comments")
+        _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", payload)
+        return
+
+    n = len(payload.get("comments", []))
+    print(f"[enforce] Posted {event} review with {n} inline comment(s)")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    if not TOKEN or not REPO or not PR_NUMBER:
+        missing = [k for k, v in {"GITHUB_TOKEN": TOKEN, "REPO": REPO, "PR_NUMBER": PR_NUMBER}.items() if not v]
+        print(f"[enforce] Missing env vars: {missing}", file=sys.stderr)
+        sys.exit(1)
+
+    if not HEAD_SHA:
+        print("[enforce] WARNING: HEAD_SHA not set — inline comments may be rejected by GitHub", file=sys.stderr)
+
+    # Load review.json
+    try:
+        review = json.loads(open(REVIEW_FILE, encoding="utf-8").read())  # noqa: WPS515
+    except FileNotFoundError:
+        print(f"[enforce] review file not found: {REVIEW_FILE} — blocking as precaution", file=sys.stderr)
+        review = {
+            "overall_tier": "HARD_BLOCK",
+            "summary": "AI reviewer did not produce a review file. Blocking as a precaution — check Step 1 logs.",
+            "findings": [],
+        }
+    except json.JSONDecodeError as exc:
+        print(f"[enforce] Malformed review JSON: {exc} — blocking as precaution", file=sys.stderr)
+        review = {
+            "overall_tier": "HARD_BLOCK",
+            "summary": "AI reviewer produced malformed output. Blocking as a precaution.",
+            "findings": [],
+        }
+
+    tier     = review.get("overall_tier", "HARD_BLOCK")
+    summary  = review.get("summary", "")
+    findings = review.get("findings", [])
+
+    post_review(tier, summary, findings)
+
+    if tier == "CLEAN":
+        add_label("sql-scan-clean")
+        print("[enforce] CLEAN — approved")
+        sys.exit(0)
+    elif tier == "DBA_REVIEW":
+        add_label("dba-review-required")
+        print("[enforce] DBA_REVIEW — changes requested, DBA required before merge")
+        sys.exit(0)   # CI green; DBA approval gates the merge via branch protection
+    else:
+        add_label("sql-hard-block")
+        print("[enforce] HARD_BLOCK — changes requested, CI failing")
+        sys.exit(1)   # CI red → merge button disabled
+
+
+if __name__ == "__main__":
+    main()
+
