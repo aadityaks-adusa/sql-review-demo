@@ -1,5 +1,5 @@
 # Owned by ADUSA-Digital Platform Engineering
-# Version: 4.0.0 — May 2026
+# Version: 4.0.1 — May 2026
 # SQL PR review pipeline — Copilot is the sole reviewer.
 #
 # Architecture (single source of truth = Copilot):
@@ -55,7 +55,6 @@ jobs:
               description: '⏳ Waiting for Copilot to submit review',
             });
 
-<<<<<<< HEAD
       - name: Request Copilot as reviewer
         uses: actions/github-script@v7
         with:
@@ -72,22 +71,6 @@ jobs:
             } catch (err) {
               core.warning('Could not request Copilot via API: ' + err.message);
             }
-=======
-  # ---------------------------------------------------------------------------
-  # JOB 2 — Parse Copilot's review → label + status check (gates merge)
-  # Runs only when Copilot submits/edits/dismisses a review on a PR that
-  # touches .sql files.
-  # ---------------------------------------------------------------------------
-  process-copilot-review:
-    if: |
-      github.event_name == 'pull_request_review' &&
-      contains(github.event.review.user.login, 'opilot')
-    name: SQL Review Tier
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
->>>>>>> origin/main
 
       - name: Wait for Copilot review
         id: wait
@@ -105,7 +88,6 @@ jobs:
                 repo:  context.repo.repo,
                 pull_number: pr,
               });
-              // Only count reviews on the CURRENT head SHA, by Copilot
               const copilotReview = reviews
                 .filter(r => r.commit_id === headSha)
                 .filter(r => (r.user?.login || '').toLowerCase().includes('opilot'))
