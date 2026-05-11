@@ -6,3 +6,4 @@ DELETE FROM public.orders_audit;
 
 UPDATE public.orders
     SET status = 'CLOSED';
+
