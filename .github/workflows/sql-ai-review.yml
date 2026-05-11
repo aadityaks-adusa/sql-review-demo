@@ -1,21 +1,19 @@
 # Owned by ADUSA-Digital Platform Engineering
-# Version: 3.0.0 — May 2026
+# Version: 4.0.0 — May 2026
 # SQL PR review pipeline — Copilot is the sole reviewer.
 #
 # Architecture (single source of truth = Copilot):
-#   1. PR opened on `.sql` files → request Copilot as reviewer
-#      (also auto-added by the "Require Copilot Review" branch ruleset)
-#   2. Copilot reviews using:
-#        .github/copilot-instructions.md
-#        .github/instructions/sql.instructions.md  (applyTo: **/*.sql)
-#      and prefixes each finding with [HARD_BLOCK] or [DBA_REVIEW]
-#      plus a tier marker on the first line of its summary.
-#   3. When Copilot submits → process_copilot_review.py parses the review,
-#      applies the tier label (sql-hard-block | dba-review-required | sql-scan-clean),
-#      and posts a "SQL Review Tier" status check that gates merge.
+#   1. PR opened on `.sql` files → Copilot is auto-requested by the ruleset.
+#   2. This workflow polls every 20s for up to 10min waiting for Copilot's review.
+#   3. When Copilot's review arrives → process_copilot_review.py parses it,
+#      applies the tier label, and posts the "SQL Review Tier" status check.
 #
-# No GitHub Models / GPT-4o / regex scan. Copilot's review is the only source
-# of findings; this workflow only labels and gates based on what Copilot says.
+# Why polling instead of pull_request_review trigger?
+#   GitHub requires manual approval for workflows triggered by bot accounts
+#   (copilot-pull-request-reviewer[bot]). Polling within the pull_request
+#   workflow runs in the trusted PR-author context, no approval needed.
+#
+# This workflow NEVER posts comments or reviews on the PR — only labels + status.
 
 name: sql-pr-scan
 
@@ -30,42 +28,19 @@ on:
     paths:
       - '**/*.sql'
 
-  pull_request_review:
-    types: [submitted, edited, dismissed]
-
 permissions:
   contents: read
-  pull-requests: write
-  issues: write
-  statuses: write
+  pull-requests: write    # request Copilot reviewer + read reviews
+  issues: write           # add/remove tier labels
+  statuses: write         # post "SQL Review Tier" commit status
 
 jobs:
-
-  # ---------------------------------------------------------------------------
-  # JOB 1 — Request Copilot as reviewer (only on the pull_request event)
-  # ---------------------------------------------------------------------------
-  request-copilot-review:
-    if: github.event_name == 'pull_request'
-    name: Request Copilot as reviewer
+  copilot-review-gate:
+    name: SQL Review Tier
     runs-on: ubuntu-latest
     steps:
-      - name: Add Copilot to reviewers
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.COPILOT_REVIEWER_PAT }}
-          script: |
-            const pr = context.payload.pull_request.number;
-            try {
-              await github.rest.pulls.requestReviewers({
-                owner: context.repo.owner,
-                repo:  context.repo.repo,
-                pull_number: pr,
-                reviewers: ['Copilot'],
-              });
-              core.info('✅ Copilot review requested');
-            } catch (err) {
-              core.warning('Could not request Copilot via API: ' + err.message);
-            }
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set status check to pending
         uses: actions/github-script@v7
@@ -80,6 +55,24 @@ jobs:
               description: '⏳ Waiting for Copilot to submit review',
             });
 
+<<<<<<< HEAD
+      - name: Request Copilot as reviewer
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.COPILOT_REVIEWER_PAT }}
+          script: |
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                reviewers: ['Copilot'],
+              });
+              core.info('✅ Copilot review requested');
+            } catch (err) {
+              core.warning('Could not request Copilot via API: ' + err.message);
+            }
+=======
   # ---------------------------------------------------------------------------
   # JOB 2 — Parse Copilot's review → label + status check (gates merge)
   # Runs only when Copilot submits/edits/dismisses a review on a PR that
@@ -94,28 +87,49 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+>>>>>>> origin/main
 
-      - name: Verify PR touches .sql files
-        id: sql-check
+      - name: Wait for Copilot review
+        id: wait
         uses: actions/github-script@v7
         with:
           script: |
-            const pr = context.payload.pull_request.number;
-            const files = await github.paginate(
-              github.rest.pulls.listFiles,
-              { owner: context.repo.owner, repo: context.repo.repo, pull_number: pr }
-            );
-            const has_sql = files.some(f => f.filename.endsWith('.sql'));
-            core.setOutput('has_sql', has_sql ? 'true' : 'false');
+            const pr      = context.payload.pull_request.number;
+            const headSha = context.payload.pull_request.head.sha;
+            const maxAttempts = 30;     // 30 × 20s = 10 min
+            const sleepMs     = 20000;
+
+            for (let i = 1; i <= maxAttempts; i++) {
+              const { data: reviews } = await github.rest.pulls.listReviews({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                pull_number: pr,
+              });
+              // Only count reviews on the CURRENT head SHA, by Copilot
+              const copilotReview = reviews
+                .filter(r => r.commit_id === headSha)
+                .filter(r => (r.user?.login || '').toLowerCase().includes('opilot'))
+                .pop();
+
+              if (copilotReview) {
+                core.info(`✅ Copilot review found (id=${copilotReview.id}) on attempt ${i}`);
+                core.setOutput('found', 'true');
+                return;
+              }
+              core.info(`⏳ attempt ${i}/${maxAttempts} — no Copilot review yet for ${headSha.slice(0,7)}, sleeping ${sleepMs/1000}s`);
+              await new Promise(r => setTimeout(r, sleepMs));
+            }
+            core.setOutput('found', 'false');
+            core.warning('Timed out waiting for Copilot review');
 
       - name: Set up Python
-        if: steps.sql-check.outputs.has_sql == 'true'
+        if: steps.wait.outputs.found == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Process Copilot review
-        if: steps.sql-check.outputs.has_sql == 'true'
+        if: steps.wait.outputs.found == 'true'
         env:
           GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
           REPO:           ${{ github.repository }}
@@ -123,3 +137,18 @@ jobs:
           HEAD_SHA:       ${{ github.event.pull_request.head.sha }}
           REVIEWER_LOGIN: copilot-pull-request-reviewer
         run: python3 .github/scripts/process_copilot_review.py
+
+      - name: Mark timeout as failure
+        if: steps.wait.outputs.found != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              context: 'SQL Review Tier',
+              state: 'failure',
+              description: '❌ Timed out waiting for Copilot — re-run workflow',
+            });
+            core.setFailed('Copilot review did not arrive within timeout');
