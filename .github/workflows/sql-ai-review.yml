@@ -88,7 +88,7 @@ jobs:
   process-copilot-review:
     if: |
       github.event_name == 'pull_request_review' &&
-      startsWith(github.event.review.user.login, 'Copilot')
+      contains(github.event.review.user.login, 'opilot')
     name: SQL Review Tier
     runs-on: ubuntu-latest
     steps:
@@ -121,5 +121,5 @@ jobs:
           REPO:           ${{ github.repository }}
           PR_NUMBER:      ${{ github.event.pull_request.number }}
           HEAD_SHA:       ${{ github.event.pull_request.head.sha }}
-          REVIEWER_LOGIN: Copilot
+          REVIEWER_LOGIN: copilot-pull-request-reviewer
         run: python3 .github/scripts/process_copilot_review.py
