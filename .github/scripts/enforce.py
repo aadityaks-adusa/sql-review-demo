@@ -212,25 +212,42 @@ def post_review(tier: str, summary: str, findings: list) -> None:
     inline = [f for f in findings if f.get("file") and (f.get("line") or 0) > 0]
     overflow = [f for f in findings if f not in inline]
 
-    # 1. Post one inline diff comment per finding with a precise line number
+    # 1. Post ALL inline diff comments in ONE batched COMMENT-type review.
+    #    state=COMMENTED → groups inline comments into a single expandable block;
+    #    does NOT take a slot in the Reviewers panel (only APPROVED /
+    #    CHANGES_REQUESTED reviews do).
     posted = 0
-    if HEAD_SHA:
-        for f in inline:
-            status = _post_inline_comment(f)
-            if 200 <= status < 300:
-                posted += 1
-            else:
-                # Line not in diff range (422) — fall through to body
-                overflow.append(f)
-    else:
-        # No commit_id → can't post inline; put everything in the body
+    if HEAD_SHA and inline:
+        payload = {
+            "event":     "COMMENT",
+            "commit_id": HEAD_SHA,
+            "body":      "",  # blank — real text is per-finding inline + the issue comment
+            "comments": [
+                {
+                    "path": f["file"],
+                    "line": f["line"],
+                    "side": "RIGHT",
+                    "body": _inline_comment_body(f),
+                }
+                for f in inline
+            ],
+        }
+        status, _ = _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", payload)
+        if 200 <= status < 300:
+            posted = len(inline)
+        else:
+            # Some line was outside the diff range — fall back: dump all into the summary
+            print(f"[enforce] inline review rejected (HTTP {status}); moving findings to body",
+                  file=sys.stderr)
+            overflow = findings
+    elif not HEAD_SHA:
         overflow = findings
 
-    # 2. Post a single summary issue-comment (not a review) with any overflow
+    # 2. Post a single summary issue-comment (regular PR comment, not a review)
     _post_issue_comment(_review_summary(tier, summary, overflow))
 
-    print(f"[enforce] Posted {posted} inline comment(s) + 1 summary comment "
-          f"({len(overflow)} finding(s) in body)")
+    print(f"[enforce] Posted {posted} inline comment(s) in 1 batched review + "
+          f"1 summary comment ({len(overflow)} finding(s) in body)")
 
 
 # ---------------------------------------------------------------------------
