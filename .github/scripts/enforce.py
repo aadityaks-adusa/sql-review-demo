@@ -176,53 +176,61 @@ def _write_step_summary(tier: str, summary: str, findings: list) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Core: post a single batched createReview with all inline comments
-# Borrowed from Medium article pattern: one API call, all comments at once
-# Falls back to body-only if GitHub rejects any line (422 = line not in diff)
+# Core: post inline review comments + a regular PR comment (NOT a formal review)
+#
+# Why not a formal review?
+#   GitHub displays anyone who submits a review (even github-actions[bot]) as a
+#   reviewer in the PR's "Reviewers" sidebar. We want Copilot to be the only
+#   visible reviewer. So:
+#     - Inline diff-line comments are posted via the "review comments" endpoint
+#       (these show as inline annotations but don't make us a "reviewer")
+#     - The summary + body-only findings go to the issues/comments endpoint
+#       (regular PR comment, not a review)
+#     - Tier-based label + CI exit code is what enforces the merge gate
 # ---------------------------------------------------------------------------
 
+def _post_inline_comment(finding: dict) -> int:
+    """Post a single inline diff comment via the pull request comments API."""
+    payload = {
+        "body":      _inline_comment_body(finding),
+        "commit_id": HEAD_SHA,
+        "path":      finding["file"],
+        "line":      finding["line"],
+        "side":      "RIGHT",
+    }
+    status, _ = _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/comments", payload)
+    return status
+
+
+def _post_issue_comment(body: str) -> None:
+    """Post a regular PR comment (does not add poster to reviewer list)."""
+    _request("POST", f"/repos/{REPO}/issues/{PR_NUMBER}/comments", {"body": body})
+
+
 def post_review(tier: str, summary: str, findings: list) -> None:
-    # GitHub Actions cannot APPROVE — use COMMENT for CLEAN, REQUEST_CHANGES for issues
-    event = "COMMENT" if tier == "CLEAN" else "REQUEST_CHANGES"
-
-    # Findings with a real file + positive line → try as inline diff comments
+    # Inline findings = file + line; the rest go in the summary comment body
     inline = [f for f in findings if f.get("file") and (f.get("line") or 0) > 0]
-    overflow = [f for f in findings if f not in inline]  # no file or line=0
+    overflow = [f for f in findings if f not in inline]
 
-    body = _review_summary(tier, summary, overflow)
-
-    payload: dict = {"event": event, "body": body}
+    # 1. Post one inline diff comment per finding with a precise line number
+    posted = 0
     if HEAD_SHA:
-        payload["commit_id"] = HEAD_SHA
+        for f in inline:
+            status = _post_inline_comment(f)
+            if 200 <= status < 300:
+                posted += 1
+            else:
+                # Line not in diff range (422) — fall through to body
+                overflow.append(f)
+    else:
+        # No commit_id → can't post inline; put everything in the body
+        overflow = findings
 
-    # Attach per-finding inline comments (one comment per finding, exact line)
-    if inline:
-        payload["comments"] = [
-            {
-                "path": f["file"],
-                "line": f["line"],
-                "side": "RIGHT",
-                "body": _inline_comment_body(f),
-            }
-            for f in inline
-        ]
+    # 2. Post a single summary issue-comment (not a review) with any overflow
+    _post_issue_comment(_review_summary(tier, summary, overflow))
 
-    status, _ = _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", payload)
-
-    if status == 422 and "comments" in payload:
-        # Line numbers not in the diff range — remove inline comments, retry body-only
-        print("[enforce] 422 — one or more lines not in diff; falling back to body-only review", file=sys.stderr)
-        payload["body"] = _review_summary(tier, summary, findings)
-        payload.pop("comments")
-        _request("POST", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews", payload)
-        return
-    elif status == 422 and event == "COMMENT":
-        # Should not happen with COMMENT event, but guard anyway
-        print("[enforce] 422 on COMMENT review — check GitHub Actions permissions", file=sys.stderr)
-        return
-
-    n = len(payload.get("comments", []))
-    print(f"[enforce] Posted {event} review — {n} inline comment(s), {len(overflow)} in body")
+    print(f"[enforce] Posted {posted} inline comment(s) + 1 summary comment "
+          f"({len(overflow)} finding(s) in body)")
 
 
 # ---------------------------------------------------------------------------
