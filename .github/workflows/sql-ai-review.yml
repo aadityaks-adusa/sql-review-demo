@@ -1,30 +1,27 @@
 # Owned by ADUSA-Digital Platform Engineering
-# Version: 2.0.0 — Updated April 2026
-# SQL AI Review — AI-first SQL PR review pipeline using GitHub Models (GPT-4o).
+# Version: 3.0.0 — May 2026
+# SQL PR review pipeline — Copilot is the sole reviewer.
 #
-# NO hardcoded regex rules. All SQL analysis is done by the AI.
-# Rules live in plain English in:
-#   .github/copilot-instructions.md  (Copilot code review — ≤4000 chars)
-#   .github/instructions/sql.instructions.md  (per-rule detail table — easy to edit)
-#   .github/scripts/sql_review_prompt.md  (full system prompt for GPT-4o)
+# Architecture (single source of truth = Copilot):
+#   1. PR opened on `.sql` files → request Copilot as reviewer
+#      (also auto-added by the "Require Copilot Review" branch ruleset)
+#   2. Copilot reviews using:
+#        .github/copilot-instructions.md
+#        .github/instructions/sql.instructions.md  (applyTo: **/*.sql)
+#      and prefixes each finding with [HARD_BLOCK] or [DBA_REVIEW]
+#      plus a tier marker on the first line of its summary.
+#   3. When Copilot submits → process_copilot_review.py parses the review,
+#      applies the tier label (sql-hard-block | dba-review-required | sql-scan-clean),
+#      and posts a "SQL Review Tier" status check that gates merge.
 #
-# Two parallel tracks:
-#   Track A: GitHub Copilot code review — posts inline comments as a formal PR reviewer
-#            (Copilot always posts COMMENT-type; cannot block merges — this is a platform limit)
-#   Track B: GitHub Models GPT-4o → enforce.py → REQUEST_CHANGES + exit 1 on HARD_BLOCK
-#            This is the enforcement gate that can actually block merges.
-#
-# Tier 1 (HARD_BLOCK): PR check fails (exit 1)
-# Tier 2 (DBA_REVIEW): PR check passes, DBA required (EDA team + label)
-# Tier 3 (CLEAN):      PR check passes, auto-approve eligible
-#
-# Rules derived from analysis of 1,190 commits across all branches and 429 SQL files.
-# See .github/docs/SQL_PR_Review_Automation_Confluence.md for full rule reasoning.
+# No GitHub Models / GPT-4o / regex scan. Copilot's review is the only source
+# of findings; this workflow only labels and gates based on what Copilot says.
 
 name: sql-pr-scan
 
 on:
   pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
     branches:
       - main
       - develop
@@ -33,29 +30,22 @@ on:
     paths:
       - '**/*.sql'
 
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
 permissions:
   contents: read
-  pull-requests: write    # post PR reviews + request reviewers
-  issues: write           # add labels
-  models: read            # GitHub Models API — no extra secrets needed
+  pull-requests: write
+  issues: write
+  statuses: write
 
 jobs:
 
   # ---------------------------------------------------------------------------
-  # JOB 1 — Request GitHub Copilot as a formal PR reviewer
-  #
-  # Copilot appears in the Reviewers panel (same as a human reviewer) and posts
-  # inline review comments on the diff lines, guided by:
-  #   .github/copilot-instructions.md
-  #   .github/instructions/sql.instructions.md  (applyTo: **/*.sql)
-  #
-  # Platform limitation: Copilot always posts COMMENT-type reviews, not
-  # REQUEST_CHANGES. It cannot block merges. Job 2 (enforce) is the gate.
-  #
-  # If this call fails (Copilot review not enabled on the repo/plan), enable it
-  # natively: Settings → Rules → Rulesets → "Automatically request Copilot code review"
+  # JOB 1 — Request Copilot as reviewer (only on the pull_request event)
   # ---------------------------------------------------------------------------
   request-copilot-review:
+    if: github.event_name == 'pull_request'
     name: Request Copilot as reviewer
     runs-on: ubuntu-latest
     steps:
@@ -65,7 +55,6 @@ jobs:
           github-token: ${{ secrets.COPILOT_REVIEWER_PAT }}
           script: |
             const pr = context.payload.pull_request.number;
-            core.info(`Requesting Copilot review on PR #${pr}`);
             try {
               await github.rest.pulls.requestReviewers({
                 owner: context.repo.owner,
@@ -73,54 +62,64 @@ jobs:
                 pull_number: pr,
                 reviewers: ['Copilot'],
               });
-              core.info('✅ Copilot review requested — check the Reviewers panel');
+              core.info('✅ Copilot review requested');
             } catch (err) {
-              core.warning('⚠️  Could not request Copilot via API: ' + err.message);
-              core.warning('Enable via: Settings → Rules → Rulesets → Automatically request Copilot code review');
+              core.warning('Could not request Copilot via API: ' + err.message);
             }
 
-  # ---------------------------------------------------------------------------
-  # JOB 2 — AI enforcement pipeline
-  #
-  # Step 1: ai_sql_reviewer.py — calls GitHub Models GPT-4o with the full diff
-  #         and the sql_review_prompt.md system prompt. No hardcoded SQL regex.
-  #         Python only does path-based file type classification + git diff retrieval.
-  #         Output: /tmp/review.json
-  #
-  # Step 2: enforce.py — reads review.json, posts a formal GitHub PR review
-  #         (REQUEST_CHANGES or APPROVE), adds labels, exits 1 on HARD_BLOCK.
-  #
-  # Safety: if the AI is unavailable → HARD_BLOCK (not silent pass-through).
-  # ---------------------------------------------------------------------------
-  sql-ai-review:
-    name: SQL AI Review
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout (full history)
-        uses: actions/checkout@v4
+      - name: Set status check to pending
+        uses: actions/github-script@v7
         with:
-          fetch-depth: 0
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              context: 'SQL Review Tier',
+              state: 'pending',
+              description: '⏳ Waiting for Copilot to submit review',
+            });
+
+  # ---------------------------------------------------------------------------
+  # JOB 2 — Parse Copilot's review → label + status check (gates merge)
+  # Runs only when Copilot submits/edits/dismisses a review on a PR that
+  # touches .sql files.
+  # ---------------------------------------------------------------------------
+  process-copilot-review:
+    if: |
+      github.event_name == 'pull_request_review' &&
+      startsWith(github.event.review.user.login, 'Copilot')
+    name: SQL Review Tier
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify PR touches .sql files
+        id: sql-check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request.number;
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              { owner: context.repo.owner, repo: context.repo.repo, pull_number: pr }
+            );
+            const has_sql = files.some(f => f.filename.endsWith('.sql'));
+            core.setOutput('has_sql', has_sql ? 'true' : 'false');
 
       - name: Set up Python
+        if: steps.sql-check.outputs.has_sql == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: "Step 1 — AI SQL Review (GitHub Models · GPT-4o)"
+      - name: Process Copilot review
+        if: steps.sql-check.outputs.has_sql == 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          SQL_REVIEW_OUTPUT: /tmp/review.json
-        run: python3 .github/scripts/ai_sql_reviewer.py
-
-      - name: "Step 2 — Enforce (post review · label · gate)"
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SQL_SCAN_REVIEW_FILE: /tmp/review.json
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 .github/scripts/enforce.py
+          GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          REPO:           ${{ github.repository }}
+          PR_NUMBER:      ${{ github.event.pull_request.number }}
+          HEAD_SHA:       ${{ github.event.pull_request.head.sha }}
+          REVIEWER_LOGIN: Copilot
+        run: python3 .github/scripts/process_copilot_review.py
