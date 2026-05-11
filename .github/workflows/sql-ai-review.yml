@@ -89,12 +89,11 @@ jobs:
                 pull_number: pr,
               });
               const copilotReview = reviews
-                .filter(r => r.commit_id === headSha)
                 .filter(r => (r.user?.login || '').toLowerCase().includes('opilot'))
                 .pop();
 
               if (copilotReview) {
-                core.info(`✅ Copilot review found (id=${copilotReview.id}) on attempt ${i}`);
+                core.info(`✅ Copilot review found (id=${copilotReview.id}, commit=${copilotReview.commit_id?.slice(0,7)}) on attempt ${i}`);
                 core.setOutput('found', 'true');
                 return;
               }

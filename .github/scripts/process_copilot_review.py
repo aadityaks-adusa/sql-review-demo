@@ -75,44 +75,61 @@ def _request(method: str, path: str, payload=None) -> tuple[int, object]:
         return exc.code, {}
 
 
-def get_copilot_review_text() -> str:
-    """Fetch the most recent review by REVIEWER_LOGIN + all its inline comments,
-    concatenated as a single string we can scan for tier tags."""
+def get_copilot_review_text() -> tuple[str, int]:
+    """Fetch the most recent review by REVIEWER_LOGIN + all its inline comments.
+
+    Returns (combined_text, inline_comment_count).
+    """
     _, reviews = _request("GET", f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews")
     if not isinstance(reviews, list):
-        return ""
+        return "", 0
 
-    # Pick the latest review submitted by the target reviewer
     bot_reviews = [
         r for r in reviews
         if (r.get("user") or {}).get("login", "").lower().startswith(REVIEWER_LOGIN.lower())
     ]
     if not bot_reviews:
         print(f"[copilot-review] No reviews found from {REVIEWER_LOGIN}", file=sys.stderr)
-        return ""
+        return "", 0
 
     latest = bot_reviews[-1]
     review_id = latest["id"]
     body = latest.get("body") or ""
 
-    # Fetch the inline comments belonging to this review
     _, comments = _request(
         "GET",
         f"/repos/{REPO}/pulls/{PR_NUMBER}/reviews/{review_id}/comments",
     )
     comment_bodies = [c.get("body", "") for c in comments] if isinstance(comments, list) else []
+    return body + "\n\n" + "\n\n".join(comment_bodies), len(comment_bodies)
 
-    return body + "\n\n" + "\n\n".join(comment_bodies)
 
+def determine_tier(text: str, inline_count: int) -> tuple[str, int, int]:
+    """Return (tier, hard_block_count, dba_review_count).
 
-def determine_tier(text: str) -> tuple[str, int, int]:
-    """Return (tier, hard_block_count, dba_review_count)."""
-    hard = len(re.findall(r"\[HARD[_ ]?BLOCK\]", text, re.IGNORECASE))
-    dba  = len(re.findall(r"\[DBA[_ ]?REVIEW\]", text, re.IGNORECASE))
+    Detects tier from multiple signals (in order of preference):
+      1. Explicit tier markers: [HARD_BLOCK] / [DBA_REVIEW]
+      2. Natural-language phrases: 'hard-block', 'hard block', 'dba review'
+      3. Rule codes: H1-H7 (hard-block tier), D1-D13 (DBA tier)
+      4. Fallback: if Copilot left inline comments at all → DBA_REVIEW
+    """
+    hard_phrase = len(re.findall(r"hard[\-_ ]?block", text, re.IGNORECASE))
+    dba_phrase  = len(re.findall(r"dba[\-_ ]?review", text, re.IGNORECASE))
+
+    # Rule codes — use word boundaries so 'D11' doesn't match inside 'OCDOMAIN-1129'
+    hard_codes = len(set(re.findall(r"\bH[1-7]\b", text)))
+    dba_codes  = len(set(re.findall(r"\bD(?:1[0-3]|[1-9])\b", text)))
+
+    hard = max(hard_phrase, hard_codes)
+    dba  = max(dba_phrase, dba_codes)
+
     if hard > 0:
         return "HARD_BLOCK", hard, dba
     if dba > 0:
         return "DBA_REVIEW", hard, dba
+    # Fallback — Copilot left findings but didn't use tier vocabulary
+    if inline_count > 0:
+        return "DBA_REVIEW", 0, inline_count
     return "CLEAN", 0, 0
 
 
@@ -144,13 +161,13 @@ def post_status(state: str, description: str) -> None:
 
 
 def main() -> None:
-    text = get_copilot_review_text()
+    text, inline_count = get_copilot_review_text()
     if not text.strip():
         print(f"[copilot-review] {REVIEWER_LOGIN} review text empty — marking pending")
         post_status("pending", f"Waiting for {REVIEWER_LOGIN} to submit a review")
         sys.exit(0)
 
-    tier, hard, dba = determine_tier(text)
+    tier, hard, dba = determine_tier(text, inline_count)
     label = TIER_LABELS[tier]
 
     remove_old_tier_labels()
