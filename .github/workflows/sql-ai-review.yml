@@ -55,6 +55,7 @@ jobs:
               description: '⏳ Waiting for Copilot to submit review',
             });
 
+<<<<<<< HEAD
       - name: Request Copilot as reviewer
         uses: actions/github-script@v7
         with:
@@ -71,6 +72,22 @@ jobs:
             } catch (err) {
               core.warning('Could not request Copilot via API: ' + err.message);
             }
+=======
+  # ---------------------------------------------------------------------------
+  # JOB 2 — Parse Copilot's review → label + status check (gates merge)
+  # Runs only when Copilot submits/edits/dismisses a review on a PR that
+  # touches .sql files.
+  # ---------------------------------------------------------------------------
+  process-copilot-review:
+    if: |
+      github.event_name == 'pull_request_review' &&
+      contains(github.event.review.user.login, 'opilot')
+    name: SQL Review Tier
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+>>>>>>> origin/main
 
       - name: Wait for Copilot review
         id: wait
